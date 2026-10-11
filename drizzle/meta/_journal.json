@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1791369427414,
+      "tag": "0000_tidy_toxin",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791373901377,
+      "tag": "0001_admin_workflow",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791431913261,
+      "tag": "0002_auth_and_messages",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1791447700444,
+      "tag": "0003_silly_lockheed",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791451592204,
+      "tag": "0004_dry_baron_strucker",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1791455247463,
+      "tag": "0005_jittery_unicorn",
+      "breakpoints": true
+    }
+  ]
+}

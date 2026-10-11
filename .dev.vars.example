@@ -1,0 +1,31 @@
+# Copy this file to `.dev.vars` for local development (it is git-ignored).
+# When hosted, set these as Worker variables / secrets.
+
+# REQUIRED for the staff panel: secret code you type once at /admin to create
+# the owner account. Choose your own and keep it private.
+ADMIN_SETUP_CODE=1288
+
+# Store WhatsApp number with country code (digits only).
+WHATSAPP_STORE_NUMBER=918459716312
+
+# Public address of the shop, used in WhatsApp "track your order" links (optional).
+# SHOP_URL=https://your-shop-address
+
+# Optional: Razorpay Standard Checkout (start with Test Mode keys).
+# The API secret and webhook secret are server-only; never put them in frontend code.
+# RAZORPAY_KEY_ID=rzp_test_...
+# RAZORPAY_KEY_SECRET=...
+# RAZORPAY_WEBHOOK_SECRET=...
+
+# Optional: send WhatsApp messages automatically (see WHATSAPP_SETUP.md).
+# Without these, staff send each message with one tap from /admin -> WhatsApp.
+# WHATSAPP_TOKEN=EAAG...                 # secret, never commit
+# WHATSAPP_PHONE_NUMBER_ID=918459716312
+# WHATSAPP_UPDATE_TEMPLATE=order_update  # utility template: {{1}} name, {{2}} order id, {{3}} message
+# WHATSAPP_OFFER_TEMPLATE=offer_update   # marketing template: {{1}} name, {{2}} offer text
+# WHATSAPP_ORDER_TEMPLATE=new_order_alert  # optional store alert
+# WHATSAPP_TEMPLATE_LANG=en
+
+# Optional: if you host on a platform that signs users in (adds identity headers),
+# these emails become admins automatically.
+# ADMIN_EMAILS=owner@example.com
