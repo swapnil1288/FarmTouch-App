@@ -17,7 +17,7 @@
 //   WHATSAPP_ORDER_TEMPLATE  – (optional) store alert template:            {{1}} order id, {{2}} customer, {{3}} total, {{4}} slot
 //   WHATSAPP_TEMPLATE_LANG   – template language code, default "en"
 
-import { env } from 'cloudflare:workers';
+import { env } from '@/lib/runtime-env';
 import { database } from './database';
 import { normaliseWhatsAppNumber, describeItem } from './whatsapp';
 import { offerNotice, orderNotice, type NoticeExtra, type NoticeKind } from './notify-text';

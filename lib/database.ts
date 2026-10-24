@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:workers';
+import { env } from '@/lib/runtime-env';
 
 export function database() {
   const db = env.DB;

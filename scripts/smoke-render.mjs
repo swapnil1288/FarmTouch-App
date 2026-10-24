@@ -1,0 +1,58 @@
+// Destructive fixture checks: run ONLY against a fresh disposable test deployment.
+import assert from 'node:assert/strict';
+if (process.env.FARMTOUCH_SMOKE_ALLOW_WRITE !== 'yes') throw new Error('Use a disposable test deployment and set FARMTOUCH_SMOKE_ALLOW_WRITE=yes.');
+const base = process.env.SMOKE_URL || 'http://127.0.0.1:10000';
+const get = (path, headers = {}) => fetch(base + path, { headers });
+const post = (path, body, headers = {}) => fetch(base + path, {
+  method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Origin: base }, body: JSON.stringify(body),
+});
+const json = async (response, status = 200) => {
+  const text = await response.text(); assert.equal(response.status, status, text); return JSON.parse(text);
+};
+const cookie = (response) => (response.headers.get('set-cookie') || '').split(';')[0];
+const ownerDetails = { code: process.env.ADMIN_SETUP_CODE, name: 'Render QA Owner', email: 'owner@farmtouch.test', phone: '9000000001', password: 'RenderOwner123!' };
+await json(await get('/api/health'));
+for (const path of ['/', '/admin', '/rider']) assert.equal((await get(path)).status, 200);
+const rejected = await fetch(base + '/api/admin/setup', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://wrong-origin.test' }, body: JSON.stringify(ownerDetails) });
+assert.equal(rejected.status, 403);
+const setup = await post('/api/admin/setup', ownerDetails);
+await json(setup);
+const owner = { cookie: cookie(setup) };
+assert.match(owner.cookie, /^ft_staff_admin=/);
+await json(await get('/api/admin/me', owner));
+assert.equal((await get('/api/admin/me', { 'oai-authenticated-user-id': 'fake', 'oai-authenticated-user-email': ownerDetails.email })).status, 401);
+assert.equal((await post('/api/admin/login', { login: ownerDetails.email, password: 'wrong-password' })).status, 401);
+await json(await post('/api/admin/login', { login: ownerDetails.email, password: ownerDetails.password }));
+assert.equal((await post('/api/admin/products', { op: 'stock', id: 'tomato', stock: 20 })).status, 401);
+await json(await post('/api/admin/products', { op: 'stock', id: 'tomato', stock: 20 }, owner));
+const catalog = await json(await get('/api/catalog'));
+const makeBody = () => ({ lines: [{ id: 'tomato', qty: 1 }], coupon: '', address: { name: 'Render QA Buyer', street: 'QA test apartment, Pune', phone: '9000000000', pin: '411057' }, slot: catalog.slots[0].id, payment: 'cod', replacement: 'ask', whatsappUpdates: true, whatsappOffers: false, requestKey: 'render-' + crypto.randomUUID() });
+const input = makeBody();
+const placed = await post('/api/orders', input);
+const buyer = { cookie: cookie(placed) };
+const { order } = await json(placed, 201);
+assert.match(buyer.cookie, /^ft_cid=/);
+const replay = await json(await post('/api/orders', input, buyer));
+assert.equal(replay.order.id, order.id); assert.equal(replay.replay, true);
+const products = await json(await get('/api/catalog'));
+assert.equal(products.products.find((p) => p.id === 'tomato').stock, 19);
+assert.equal((await json(await get('/api/orders', buyer))).orders.length, 1);
+assert.equal((await json(await get('/api/orders'))).orders.length, 0);
+assert.equal((await json(await get('/api/admin/orders?q=render%20qa', owner))).orders.length, 1);
+await json(await get('/api/admin/customers?q=qa', owner));
+await json(await get('/api/admin/reports', owner));
+const action = async (id, action, extra = {}) => (await json(await post('/api/admin/orders', { id, action, ...extra }, owner))).order;
+await action(order.id, 'confirm');
+const packing = await action(order.id, 'toggle_item', { itemKey: 'tomato' });
+assert.equal(packing.status, 'packing');
+await action(order.id, 'mark_packed');
+await json(await post('/api/admin/staff', { email: 'rider@farmtouch.test', name: 'QA Rider', phone: '9000000002', role: 'delivery', active: true, password: 'RenderRider123!' }, owner));
+await action(order.id, 'assign', { assignee: 'rider@farmtouch.test' });
+await action(order.id, 'out_for_delivery');
+const delivered = await action(order.id, 'delivered', { cash: order.totals.total });
+assert.equal(delivered.status, 'delivered');
+const second = await json(await post('/api/orders', makeBody(), buyer), 201);
+await json(await post('/api/orders/cancel', { id: second.order.id }, buyer));
+assert.equal((await json(await get('/api/catalog'))).products.find((p) => p.id === 'tomato').stock, 19);
+await json(await get('/api/admin/messages', owner));
+console.log('PASS production HTTP: pages, health, setup/login, header spoof rejection, permissions, guest checkout/history, replay, stock, JSON search, reports, packing/delivery, cancellation and messages.');

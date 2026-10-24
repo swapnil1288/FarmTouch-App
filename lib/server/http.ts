@@ -1,3 +1,5 @@
+import { publicOrigin } from './origin';
+
 // Small HTTP helpers for API routes (server only).
 
 export class HttpError extends Error {
@@ -28,7 +30,7 @@ export async function readJsonBody(request: Request): Promise<unknown> {
   // make the runtime drop the connection.
   const raw = await request.text();
   const origin = request.headers.get('origin');
-  if (origin && origin !== new URL(request.url).origin) throw new HttpError(403, 'Request origin rejected.');
+  if (origin && origin !== publicOrigin(request)) throw new HttpError(403, 'Request origin rejected.');
   if (!(request.headers.get('content-type') ?? '').includes('application/json')) throw new HttpError(415, 'Expected JSON.');
   if (raw.length > MAX_BODY_BYTES) throw new HttpError(413, 'Request is too large.');
   try {
