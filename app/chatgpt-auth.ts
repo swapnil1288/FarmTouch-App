@@ -1,3 +1,4 @@
+import { isPublicNodeRuntime } from "@/lib/runtime-env";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 
@@ -19,6 +20,8 @@ const SIGN_OUT_PATH = "/signout-with-chatgpt";
 const CALLBACK_PATH = "/callback";
 
 export async function getChatGPTUser(): Promise<ChatGPTUser | null> {
+  // Public Node hosting does not verify these platform identity headers.
+  if (isPublicNodeRuntime) return null;
   const requestHeaders = await headers();
   const userId = requestHeaders.get(USER_ID_HEADER);
   const email = requestHeaders.get(USER_EMAIL_HEADER);

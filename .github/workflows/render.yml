@@ -1,0 +1,49 @@
+name: Render backend
+on:
+  pull_request:
+  push:
+    branches: [render-postgres]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: farmtouch_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:test-password@localhost:5432/farmtouch_test
+      ADMIN_SETUP_CODE: smoke-test-only-code
+      WHATSAPP_STORE_NUMBER: '919000000099'
+      ADMIN_EMAILS: owner@farmtouch.test
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+          cache: npm
+      - run: npm ci --include=dev
+      - run: npm test
+      - run: npm run test:postgres
+      - run: npm run build:render
+      - name: Production HTTP smoke check
+        shell: bash
+        run: |
+          npm run start:render > /tmp/farmtouch-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; cat /tmp/farmtouch-server.log' EXIT
+          for attempt in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:10000/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          FARMTOUCH_SMOKE_ALLOW_WRITE=yes npm run test:render:http

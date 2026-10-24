@@ -1,3 +1,4 @@
+import { publicOrigin } from './origin';
 // Passwords, staff sessions and customer device identity (server only).
 import { headers } from 'next/headers';
 import { database } from '@/lib/database';
@@ -70,7 +71,7 @@ function cookie(name: string, value: string, maxAgeSeconds: number, secure: bool
 }
 
 function isSecure(request: Request): boolean {
-  return new URL(request.url).protocol === 'https:';
+  return new URL(publicOrigin(request)).protocol === 'https:';
 }
 
 async function sha256(text: string): Promise<string> {

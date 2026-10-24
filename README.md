@@ -62,6 +62,10 @@ Security:
 
 **Daily routine:** Orders → confirm new orders → Packing (choose the day) → print the pick list → pack each order using its checklist → Dispatch → assign a partner and send out → partners deliver from their phone → Dashboard shows cash collected per partner.
 
+## Deploy on Render
+
+See [RENDER_SETUP.md](RENDER_SETUP.md) for the Node.js + PostgreSQL deployment, environment variables and owner setup. The original local Cloudflare commands below are unchanged.
+
 ## Setup on a Windows PC (PowerShell)
 
 Install **Node.js 22.13+ (Node 24 recommended)** and **pnpm 10+**. Extract the ZIP, for example to `C:\Projects\farmtouch`, and open PowerShell in that folder.

@@ -1,5 +1,5 @@
 // Staff identity and roles (server only).
-import { env } from 'cloudflare:workers';
+import { env } from '@/lib/runtime-env';
 import { headers } from 'next/headers';
 import { getChatGPTUser } from '@/app/chatgpt-auth';
 import { database } from '@/lib/database';
