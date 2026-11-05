@@ -138,3 +138,5 @@ The server recalculates every price. The client never sends a total.
 4. Slot capacity limits (max orders per morning), GST invoices and product photo upload are not built yet. New products choose from the existing photos.
 5. Add privacy, terms and refund pages. Decide how long to keep customer addresses and phone numbers.
 6. Test on real devices. Set up monitoring, backups and rate limiting.
+#   F r e s h v e g e s  
+ 
