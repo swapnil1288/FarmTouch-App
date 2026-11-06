@@ -1,10 +1,10 @@
 // Dashboard numbers and CSV export (server only).
 import { istDate, labelForSlotId } from '@/lib/catalog';
 import { database } from '@/lib/database';
-import { settlementSummary } from '@/lib/settlement';
+import { paymentBreakdown, settlementSummary } from '@/lib/settlement';
 import { csvEscape, packingRows, type OrderRecord } from '@/lib/orders';
 import { ORDER_STATUSES, STATUS_LABEL, type OrderStatus } from '@/lib/workflow';
-import { listOrders } from './orders';
+import { listAllOrders } from './orders';
 import { listProducts } from './products';
 
 /** ISO timestamp for 00:00 IST on a given India date (YYYY-MM-DD). */
@@ -15,13 +15,13 @@ export function istStartIso(date: string): string {
 export async function dashboard(days = 7) {
   const today = istDate();
   const from = istDate(new Date(), -(days - 1));
-  const orders = await listOrders({ from: istStartIso(from), limit: 2000 });
+  const orders = await listAllOrders({ from: istStartIso(from) });
   const accountRows = await database().prepare('SELECT phone, account_type, business_name FROM customers').all<{ phone: string; account_type: string; business_name: string }>();
   const customerAccounts = Object.fromEntries(accountRows.results.map((r) => [r.phone, {
     accountType: r.account_type === 'b2b' ? 'b2b' as const : 'retail' as const,
     businessName: r.business_name,
   }]));
-  const open = await listOrders({ status: 'open', limit: 2000 });
+  const open = await listAllOrders({ status: 'open' });
 
   const todayStart = istStartIso(today);
   const todays = orders.filter((o) => o.createdAt >= todayStart);
@@ -86,9 +86,7 @@ export async function dashboard(days = 7) {
       orders: orders.filter(nonCancelled).length,
       sales: orders.filter(nonCancelled).reduce((n, o) => n + o.totals.total, 0),
       delivered: orders.filter((o) => o.status === 'delivered').length,
-      collected: orders.reduce((n, o) => n + (o.payment === 'online' && o.paymentStatus === 'paid'
-        ? o.totals.total
-        : o.status === 'delivered' ? (o.cashCollected ?? 0) : 0), 0),
+      collected: orders.reduce((n, o) => { const m = paymentBreakdown(o); return n + m.cashCollected + m.onlinePaid; }, 0),
     },
     byStatus,
     perDay: [...perDay.values()],
@@ -102,7 +100,7 @@ export async function dashboard(days = 7) {
 
 export async function ordersCsv(fromDate: string, toDate: string): Promise<string> {
   const toExclusive = new Date(Date.parse(toDate + 'T00:00:00+05:30') + 86400000).toISOString();
-  const orders = await listOrders({ from: istStartIso(fromDate), to: toExclusive, limit: 2000 });
+  const orders = await listAllOrders({ from: istStartIso(fromDate), to: toExclusive });
   const header = ['Order ID', 'Placed at (IST)', 'Status', 'Delivery slot', 'Customer', 'Phone', 'Address', 'Pincode', 'Items', 'Item total', 'Discount', 'Delivery fee', 'Total', 'Coupon', 'Delivery partner', 'Cash collected'];
   const fmt = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Kolkata' });
   const rows = orders.map((o) => [

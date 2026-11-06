@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { checkLogin } from '@/lib/server/staff';
 import { createStaffSession } from '@/lib/server/auth';
+import { rateLimit } from '@/lib/server/rate-limit';
 import { HttpError, errorResponse, readJsonBody } from '@/lib/server/http';
 
 const schema = z.object({
@@ -13,6 +14,7 @@ const schema = z.object({
 export async function POST(request: Request) {
   try {
     const parsed = schema.safeParse(await readJsonBody(request));
+    await rateLimit(request, 'login');
     if (!parsed.success) throw new HttpError(400, 'Enter your email (or phone) and password.');
     const member = await checkLogin(parsed.data.login, parsed.data.password);
     if (parsed.data.portal === 'rider' && member.role !== 'delivery') throw new HttpError(403, 'Use delivery staff credentials to sign in to the rider portal.');

@@ -80,12 +80,25 @@ async function eventsFor(ids: string[]): Promise<Map<string, OrderEvent[]>> {
 
 export type NewOrder = Omit<OrderRecord, 'status' | 'updatedAt' | 'packed' | 'cashCollected' | 'assignee' | 'events'>;
 
+/** A fresh order id (FT- + 8 hex) not yet used by any order or online checkout. */
+export async function newOrderId(): Promise<string> {
+  const db = database();
+  for (let i = 0; i < 5; i++) {
+    const id = 'FT-' + crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+    const taken = await db.prepare('SELECT 1 FROM orders WHERE id = ?1 UNION ALL SELECT 1 FROM payment_intents WHERE id = ?1 LIMIT 1').bind(id).first();
+    if (!taken) return id;
+  }
+  throw new HttpError(503, 'Could not create an order number. Please try again.');
+}
+
 /**
  * Saves an order and reserves stock in ONE atomic batch. The products table has
  * CHECK (stock >= 0), so if two customers race for the last packs, one batch
  * fails and nothing is saved for that customer.
  */
-export async function createOrder(owner: string, requestKey: string, order: NewOrder, packs: Record<string, number>) {
+export async function createOrder(
+  owner: string, requestKey: string, order: NewOrder, packs: Record<string, number>, retried = false,
+): Promise<{ order: OrderRecord | null; created: boolean }> {
   const db = database();
   const key = `${owner}:${requestKey}`;
   const existing = await db.prepare(`${SELECT_ORDER} WHERE o.request_key = ? AND o.owner = ?`).bind(key, owner).first<OrderRow>();
@@ -96,8 +109,8 @@ export async function createOrder(owner: string, requestKey: string, order: NewO
     db.prepare('UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ?').bind(q, now, id),
   );
   stmts.push(
-    db.prepare('INSERT INTO orders (id, owner, request_key, payload, created_at, status, slot, total, packed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(order.id, owner, key, JSON.stringify(order), now, 'placed', order.slot, order.totals.total, '[]', now),
+    db.prepare('INSERT INTO orders (id, owner, request_key, payload, created_at, status, slot, total, packed, updated_at, phone, coupon) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(order.id, owner, key, JSON.stringify(order), now, 'placed', order.slot, order.totals.total, '[]', now, order.address.phone, order.coupon ?? ''),
     db.prepare('INSERT INTO order_events (order_id, status, action, actor, note, created_at) VALUES (?, ?, ?, ?, ?, ?)')
       .bind(order.id, 'placed', 'placed', 'customer', null, now),
   );
@@ -112,6 +125,10 @@ export async function createOrder(owner: string, requestKey: string, order: NewO
     if (/CHECK constraint failed/i.test(msg)) {
       const short = await shortages(packs);
       throw new HttpError(409, short.length ? `Sorry, ${short.join(', ')} just sold out. Please update your cart.` : 'Some items just sold out. Please update your cart.');
+    }
+    // Another order grabbed the same id at the same moment: try once more with a new one.
+    if (/UNIQUE constraint failed: orders\.id/i.test(msg) && !retried) {
+      return createOrder(owner, requestKey, { ...order, id: await newOrderId() }, packs, true);
     }
     throw e;
   }
@@ -161,6 +178,16 @@ export async function customerCancel(owner: string, id: string, siteUrl?: string
 
 // ---------------------------------------------------------------- staff side
 
+/** Orders a packer may open: those still waiting to be packed (or just packed). */
+export const PACKER_STATUSES: OrderStatus[] = ['placed', 'confirmed', 'packing', 'packed'];
+
+/** Why this staff member may not open the order, or null if they may. */
+export function staffAccessProblem(staff: StaffSession, order: OrderRecord): string | null {
+  if (staff.role === 'delivery' && order.assignee?.email !== staff.email) return 'This order is not assigned to you.';
+  if (staff.role === 'packer' && !PACKER_STATUSES.includes(order.status)) return 'Packers can only open orders that are waiting to be packed.';
+  return null;
+}
+
 export async function getOrder(id: string, withEvents = true): Promise<OrderRecord | null> {
   const row = await database().prepare(`${SELECT_ORDER} WHERE o.id = ?`).bind(id).first<OrderRow>();
   const order = row ? rowToOrder(row) : null;
@@ -168,25 +195,61 @@ export async function getOrder(id: string, withEvents = true): Promise<OrderReco
   return order;
 }
 
-export type OrderFilter = { status?: string; slot?: string; q?: string; assignee?: string; from?: string; to?: string; limit?: number };
+export type OrderFilter = {
+  status?: string; slot?: string; q?: string; assignee?: string; from?: string; to?: string;
+  /** Exact customer mobile (uses the indexed `phone` column). */
+  phone?: string;
+  limit?: number;
+  /** Keyset cursor: only orders strictly older than this one (for paging). */
+  before?: { createdAt: string; id: string };
+};
 
-export async function listOrders(f: OrderFilter): Promise<OrderRecord[]> {
+const PAGE_SIZE = 1000;
+
+async function queryOrders(f: OrderFilter): Promise<OrderRow[]> {
   const where: string[] = [];
   const args: unknown[] = [];
   if (f.status === 'open') { where.push(`o.status IN (${OPEN_STATUSES.map(() => '?').join(',')})`); args.push(...OPEN_STATUSES); }
   else if (f.status && isOrderStatus(f.status)) { where.push('o.status = ?'); args.push(f.status); }
-  if (f.slot) { where.push('o.slot LIKE ?'); args.push(f.slot.slice(0, 10) + '%'); }
+  if (f.slot) { where.push('o.slot LIKE ?'); args.push(f.slot.slice(0, 10).replace(/[%_]/g, '') + '%'); }
   if (f.assignee) { where.push('o.assignee = ?'); args.push(f.assignee); }
+  if (f.phone) { where.push('o.phone = ?'); args.push(f.phone); }
   if (f.from) { where.push('o.created_at >= ?'); args.push(f.from); }
   if (f.to) { where.push('o.created_at < ?'); args.push(f.to); }
+  if (f.before) { where.push('(o.created_at < ? OR (o.created_at = ? AND o.id < ?))'); args.push(f.before.createdAt, f.before.createdAt, f.before.id); }
   if (f.q) {
-    where.push("(o.id LIKE ? OR json_extract(o.payload, '$.address.name') LIKE ? OR json_extract(o.payload, '$.address.phone') LIKE ?)");
+    where.push("(o.id LIKE ? OR json_extract(o.payload, '$.address.name') LIKE ? OR o.phone LIKE ?)");
     const like = '%' + f.q.replace(/[%_]/g, '') + '%';
     args.push(like, like, like);
   }
-  const sql = `${SELECT_ORDER} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY o.created_at DESC LIMIT ${Math.min(f.limit ?? 200, 2000)}`;
-  const res = await database().prepare(sql).bind(...args).all<OrderRow>();
-  return res.results.map(rowToOrder).filter((o): o is OrderRecord => !!o);
+  const limit = Number.isInteger(f.limit) && f.limit! > 0 ? Math.min(f.limit!, PAGE_SIZE) : 200;
+  const sql = `${SELECT_ORDER} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY o.created_at DESC, o.id DESC LIMIT ${limit}`;
+  return (await database().prepare(sql).bind(...args).all<OrderRow>()).results;
+}
+
+/** One page of orders, newest first (at most 1000). */
+export async function listOrders(f: OrderFilter): Promise<OrderRecord[]> {
+  return (await queryOrders(f)).map(rowToOrder).filter((o): o is OrderRecord => !!o);
+}
+
+/**
+ * EVERY order matching the filter (paged internally), for reports and exports.
+ * Refuses with a clear message instead of silently returning a partial list.
+ */
+export async function listAllOrders(f: Omit<OrderFilter, 'limit' | 'before'>, max = 10_000): Promise<OrderRecord[]> {
+  const out: OrderRecord[] = [];
+  let before: OrderFilter['before'];
+  for (;;) {
+    const rows = await queryOrders({ ...f, limit: PAGE_SIZE, before });
+    for (const r of rows) {
+      const o = rowToOrder(r);
+      if (o) out.push(o);
+    }
+    if (out.length > max) throw new HttpError(413, `More than ${max.toLocaleString('en-IN')} orders match. Please choose a shorter date range.`);
+    if (rows.length < PAGE_SIZE) return out;
+    const last = rows[rows.length - 1];
+    before = { createdAt: last.created_at, id: last.id };
+  }
 }
 
 /**
@@ -442,7 +505,7 @@ export type PickRow = { productId: string; name: string; unit: string; packs: nu
 
 /** Total packs to pick for a delivery day (orders not yet packed). */
 export async function pickList(slotDate: string) {
-  const orders = (await listOrders({ slot: slotDate, limit: 2000 })).filter((o) => ['placed', 'confirmed', 'packing'].includes(o.status));
+  const orders = (await listAllOrders({ slot: slotDate })).filter((o) => ['placed', 'confirmed', 'packing'].includes(o.status));
   const map = new Map<string, PickRow>();
   for (const o of orders) {
     const seen = new Set<string>();

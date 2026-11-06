@@ -44,7 +44,7 @@ function load(name) {
   return mod.exports;
 }
 
-const { getSlots, createCatalog, SAMPLE_PRODUCTS, packsNeeded, labelForSlotId } = load('catalog');
+const { getSlots, createCatalog, SAMPLE_PRODUCTS, packsNeeded, labelForSlotId, pinProblem, DEFAULT_COUPONS } = load('catalog');
 const cat = createCatalog(SAMPLE_PRODUCTS);
 const { priceCart, linePrice, mrpSavings, basketPrice, defaultBasket } = cat;
 const { validateOrder: validateWith } = load('order-validation');
@@ -155,6 +155,49 @@ test('slot id and label agree late evening IST', () => {
 });
 test('slots roll over month end', () => assert.deepEqual(getSlots(new Date('2026-10-31T06:00:00Z')).map((s) => s.id), ['2026-11-01-morning', '2026-11-02-morning', '2026-11-03-morning']));
 test('slot label from id', () => assert.match(labelForSlotId('2026-10-08-morning'), /8 Oct · 9 AM – 12 PM/));
+
+// --- store rules (closed days, capacity, delivery pincodes, live coupons)
+test('closed days are skipped and the next open days offered', () => {
+  const ids = getSlots(new Date('2026-10-31T06:00:00Z'), { closed: ['2026-11-02'] }).map((s) => s.id);
+  assert.deepEqual(ids, ['2026-11-01-morning', '2026-11-03-morning', '2026-11-04-morning']);
+});
+test('number of delivery days is configurable', () => assert.equal(getSlots(new Date('2026-10-31T06:00:00Z'), { days: 5 }).length, 5));
+test('pincode: default accepts any 411xxx only', () => {
+  assert.equal(pinProblem('411045', null), null);
+  assert.match(pinProblem('400001', null), /411xxx/);
+  assert.match(pinProblem('4110', null), /6-digit/);
+});
+test('pincode: a delivery list restricts orders to those pincodes', () => {
+  assert.equal(pinProblem('411045', ['411045', '411057']), null);
+  assert.match(pinProblem('411001', ['411045']), /do not deliver to 411001/);
+  assert.equal(pinProblem('411001', []), null, 'empty list falls back to 411xxx');
+});
+test('order to a pincode outside the delivery list is rejected', () => {
+  assert.throws(() => validateWith(base(), cat, { slots: getSlots(), pincodes: ['411045'] }), /do not deliver to 411057/);
+  assert.equal(validateWith(base(), cat, { slots: getSlots(), pincodes: ['411057'] }).totals.total, 92);
+});
+test('fully booked slot is rejected', () => {
+  const slots = getSlots().map((s, i) => (i === 0 ? { ...s, full: true } : s));
+  assert.throws(() => validateWith(base(), cat, { slots, pincodes: null }), /fully booked/);
+  assert.ok(validateWith({ ...base(), slot: slots[1].id }, cat, { slots, pincodes: null }));
+});
+test('closed (not offered) slot is rejected', () => {
+  const slots = getSlots().slice(1);
+  assert.throws(() => validateWith(base(), cat, { slots, pincodes: null }), /no longer available/);
+});
+test('coupons come from the live list: new codes work, removed or expired ones do not', () => {
+  const lines = [{ id: 'apple', qty: 4 }];
+  const live = createCatalog(SAMPLE_PRODUCTS, [{ code: 'WELCOME30', amount: 30, min: 0, title: 'Hi' }]);
+  assert.equal(live.priceCart(lines, 'WELCOME30').discount, 30);
+  assert.equal(live.priceCart(lines, 'FRESH50').discount, 0, 'FRESH50 not in the live list');
+  assert.equal(validateWith({ ...base(), coupon: 'welcome30' }, live).totals.discount, 30, 'codes are case-insensitive');
+  assert.throws(() => validateWith({ ...base(), coupon: 'FRESH50' }, live), /not valid or has expired/);
+});
+test('coupon discount never exceeds the item total', () => {
+  const live = createCatalog(SAMPLE_PRODUCTS, [{ code: 'BIG', amount: 500, min: 0, title: 'Big' }]);
+  assert.equal(live.priceCart([{ id: 'tomato', qty: 1 }], 'BIG').discount, 40);
+});
+test('default coupons are unchanged', () => assert.deepEqual(DEFAULT_COUPONS.map((c) => c.code), ['FRESH50', 'BASKET75']));
 
 // --- WhatsApp
 test('WhatsApp numbers are normalised', () => {

@@ -20,9 +20,16 @@ export const orders = sqliteTable(
     packed: text('packed').notNull().default('[]'),
     cashCollected: integer('cash_collected'),
     updatedAt: text('updated_at').notNull().default(''),
+    /** Customer mobile (copy of payload.address.phone) so lookups by phone can use an index. */
+    phone: text('phone').notNull().default(''),
+    /** Coupon code used ('' = none), copied from the payload for usage limits. */
+    coupon: text('coupon').notNull().default(''),
   },
   (t) => [
     index('idx_orders_owner').on(t.owner),
+    index('idx_orders_phone').on(t.phone),
+    index('idx_orders_coupon').on(t.coupon),
+    index('idx_orders_created').on(t.createdAt),
     index('idx_orders_status').on(t.status),
     index('idx_orders_slot').on(t.slot),
     index('idx_orders_assignee').on(t.assignee),
@@ -130,6 +137,62 @@ export const paymentStockHolds = sqliteTable(
     releasedAt: text('released_at'),
   },
   (t) => [index('idx_payment_stock_holds_intent').on(t.paymentIntentId, t.releasedAt)],
+);
+
+/** Discount coupons managed in /admin → Store. A flat ₹ amount off the item total. */
+export const coupons = sqliteTable(
+  'coupons',
+  {
+    code: text('code').primaryKey(),
+    title: text('title').notNull(),
+    amount: integer('amount').notNull(),
+    min: integer('min').notNull().default(0),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    /** ISO time; null = never expires. */
+    expiresAt: text('expires_at'),
+    firstOrderOnly: integer('first_order_only', { mode: 'boolean' }).notNull().default(false),
+    /** Uses per mobile number (0 = unlimited). */
+    perCustomer: integer('per_customer').notNull().default(0),
+    /** Total uses across all customers (0 = unlimited). */
+    maxUses: integer('max_uses').notNull().default(0),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (t) => [check('coupons_amount_positive', sql`${t.amount} > 0`)],
+);
+
+/** Per-date delivery overrides: closed days and capacity. */
+export const slotDays = sqliteTable('slot_days', {
+  /** India date YYYY-MM-DD. */
+  date: text('date').primaryKey(),
+  closed: integer('closed', { mode: 'boolean' }).notNull().default(false),
+  /** Max orders for this date (null = the default from settings). */
+  capacity: integer('capacity'),
+  note: text('note').notNull().default(''),
+});
+
+/** Simple shop-wide settings (key → value). */
+export const settings = sqliteTable('settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+});
+
+/** Pincodes the shop delivers to. Empty list = any Pune postcode (411xxx). */
+export const servicePincodes = sqliteTable('service_pincodes', {
+  pin: text('pin').primaryKey(),
+  area: text('area').notNull().default(''),
+  active: integer('active', { mode: 'boolean' }).notNull().default(true),
+});
+
+/** Fixed-window request counters for rate limiting (key = action + client IP). */
+export const rateLimits = sqliteTable(
+  'rate_limits',
+  {
+    key: text('key').primaryKey(),
+    windowStart: integer('window_start').notNull(),
+    count: integer('count').notNull().default(0),
+  },
+  (t) => [index('idx_rate_limits_window').on(t.windowStart)],
 );
 
 /** Customers (by phone) and their WhatsApp consent. Filled from orders. */

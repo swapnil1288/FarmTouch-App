@@ -1,10 +1,17 @@
 import { z } from 'zod';
-import { requireStaff } from '@/lib/server/staff';
-import { getOrder } from '@/lib/server/orders';
+import { requireStaff, type StaffSession } from '@/lib/server/staff';
+import { getOrder, staffAccessProblem } from '@/lib/server/orders';
 import { HttpError, errorResponse, json, readJsonBody } from '@/lib/server/http';
 import {
-  countTodo, createOfferBroadcast, dismiss, listNotifications, markManual, processQueue, retry, sendTest, whatsappStatus,
+  countTodo, createOfferBroadcast, dismiss, listNotifications, markManual, notificationOrderId, processQueue, retry, sendTest, whatsappStatus,
 } from '@/lib/whatsapp-server';
+
+async function requireOrderAccess(me: StaffSession, orderId: string): Promise<void> {
+  const o = await getOrder(orderId, false);
+  if (!o) throw new HttpError(404, 'Order not found.');
+  const problem = staffAccessProblem(me, o);
+  if (problem) throw new HttpError(403, problem);
+}
 
 /** GET ?status=todo|all|sent|failed|pending&orderId=FT-… */
 export async function GET(request: Request) {
@@ -15,8 +22,7 @@ export async function GET(request: Request) {
     if (me.role !== 'admin') {
       // Packers / delivery partners only see messages for an order they can open.
       if (!orderId) throw new HttpError(403, 'Only admins can see all messages.');
-      const o = await getOrder(orderId, false);
-      if (!o || (me.role === 'delivery' && o.assignee?.email !== me.email)) throw new HttpError(403, 'Not your order.');
+      await requireOrderAccess(me, orderId);
     }
     return json({
       config: whatsappStatus(),
@@ -46,7 +52,12 @@ export async function POST(request: Request) {
     const by = `${me.name} (${me.role})`;
     switch (body.op) {
       case 'mark_sent':
-        // Any staff member may confirm they sent a message by hand.
+        // Staff may confirm they sent a message by hand — non-admins only for orders they can open.
+        if (me.role !== 'admin') {
+          const orderId = await notificationOrderId(body.id);
+          if (!orderId) throw new HttpError(403, 'Only admins can handle this message.');
+          await requireOrderAccess(me, orderId);
+        }
         if (!(await markManual(body.id, by))) throw new HttpError(409, 'This message was already handled.');
         return json({ ok: true });
       case 'dismiss':

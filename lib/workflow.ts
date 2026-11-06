@@ -104,5 +104,6 @@ export function canDo(action: OrderAction, role: StaffRole, status: OrderStatus)
 }
 
 export function isOrderAction(v: unknown): v is OrderAction {
-  return typeof v === 'string' && v in ACTION_RULES;
+  // Own keys only: `in` would also accept inherited names like "toString" or "constructor".
+  return typeof v === 'string' && Object.prototype.hasOwnProperty.call(ACTION_RULES, v);
 }

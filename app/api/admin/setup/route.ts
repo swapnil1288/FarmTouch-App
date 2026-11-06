@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { database } from '@/lib/database';
 import { needsSetup, setupCode } from '@/lib/server/staff';
 import { createStaffSession, hashPassword, passwordProblem } from '@/lib/server/auth';
+import { rateLimit } from '@/lib/server/rate-limit';
 import { HttpError, errorResponse, nowIso, readJsonBody } from '@/lib/server/http';
 
 const schema = z
@@ -18,6 +19,7 @@ const schema = z
 export async function POST(request: Request) {
   try {
     const parsed = schema.safeParse(await readJsonBody(request));
+    await rateLimit(request, 'setup');
     if (!(await needsSetup())) throw new HttpError(409, 'The owner account already exists. Please log in.');
     const expected = setupCode();
     if (!expected) throw new HttpError(503, 'Setup is locked. Set the ADMIN_SETUP_CODE variable first (see README).');

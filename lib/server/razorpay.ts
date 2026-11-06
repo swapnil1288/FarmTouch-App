@@ -2,7 +2,7 @@ import { env } from 'cloudflare:workers';
 import { database } from '@/lib/database';
 import type { NewOrder } from '@/lib/server/orders';
 import type { OrderRecord } from '@/lib/orders';
-import { getOrder } from '@/lib/server/orders';
+import { getOrder, newOrderId } from '@/lib/server/orders';
 import { alertStore, notifyCustomer, upsertCustomer } from '@/lib/whatsapp-server';
 import { razorpayHmac, rupeesToPaise, verifyRazorpaySignature } from '@/lib/payment-signature';
 import { HttpError, nowIso } from './http';
@@ -80,7 +80,8 @@ export async function startPaymentIntent(owner: string, requestKey: string, orde
   if (previous?.status === 'paid') return { intent: previous, created: false };
   if (previous?.status === 'pending' && previous.expires_at > now) return { intent: previous, created: false };
 
-  const id = 'FT-' + crypto.randomUUID().slice(0, 8).toUpperCase();
+  // Checked against orders too: the paid order later reuses this id.
+  const id = await newOrderId();
   const amount = rupeesToPaise(order.totals.total);
   const gatewayOrder = await createProviderOrder(amount, id);
   const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60_000).toISOString();
@@ -124,17 +125,23 @@ export async function expirePaymentIntents(): Promise<void> {
   const now = nowIso();
   const expired = await db.prepare("SELECT id FROM payment_intents WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at LIMIT 100")
     .bind(now).all<{ id: string }>();
-  for (const { id } of expired.results) {
-    await db.batch([
-      db.prepare("UPDATE payment_intents SET status = 'expired', inventory_released = 1 WHERE id = ? AND status = 'pending' AND expires_at <= ?").bind(id, now),
-      db.prepare(`UPDATE products SET stock = stock + (
-        SELECT COALESCE(SUM(quantity), 0) FROM payment_stock_holds WHERE payment_intent_id = ? AND product_id = products.id AND released_at IS NULL
-      ) WHERE id IN (SELECT product_id FROM payment_stock_holds WHERE payment_intent_id = ? AND released_at IS NULL)
-        AND EXISTS (SELECT 1 FROM payment_intents WHERE id = ? AND status = 'expired' AND inventory_released = 1)`)
-        .bind(id, id, id),
-      db.prepare('UPDATE payment_stock_holds SET released_at = ? WHERE payment_intent_id = ? AND released_at IS NULL').bind(now, id),
-    ]);
-  }
+  for (const { id } of expired.results) await releaseExpiredIntent(id, now);
+}
+
+/** Marks one pending intent whose hold has run out as expired and returns its stock (once only). */
+async function releaseExpiredIntent(id: string, now = nowIso()): Promise<void> {
+  const db = database();
+  await db.batch([
+    db.prepare("UPDATE payment_intents SET status = 'expired', inventory_released = 1 WHERE id = ? AND status = 'pending' AND expires_at <= ?").bind(id, now),
+    // Only release holds when this intent really is expired (not paid).
+    db.prepare(`UPDATE products SET stock = stock + (
+      SELECT COALESCE(SUM(quantity), 0) FROM payment_stock_holds WHERE payment_intent_id = ? AND product_id = products.id AND released_at IS NULL
+    ) WHERE id IN (SELECT product_id FROM payment_stock_holds WHERE payment_intent_id = ? AND released_at IS NULL)
+      AND EXISTS (SELECT 1 FROM payment_intents WHERE id = ? AND status = 'expired' AND inventory_released = 1)`)
+      .bind(id, id, id),
+    db.prepare(`UPDATE payment_stock_holds SET released_at = ? WHERE payment_intent_id = ? AND released_at IS NULL
+      AND EXISTS (SELECT 1 FROM payment_intents WHERE id = ? AND status = 'expired')`).bind(now, id, id),
+  ]);
 }
 
 async function fetchPayment(paymentId: string): Promise<GatewayPayment> {
@@ -177,10 +184,10 @@ async function finalizePayment(intent: PaymentIntentRow, paymentId: string): Pro
   const results = await db.batch([
     db.prepare("UPDATE payment_intents SET status = 'paid', payment_id = ?, inventory_released = 1 WHERE id = ? AND status = 'pending' AND expires_at > ? AND inventory_released = 0")
       .bind(paymentId, intent.id, now),
-    db.prepare(`INSERT INTO orders (id, owner, request_key, payload, created_at, status, slot, total, packed, updated_at)
-      SELECT ?, ?, ?, ?, ?, 'placed', ?, ?, '[]', ? WHERE EXISTS (SELECT 1 FROM payment_intents WHERE id = ? AND status = 'paid')
+    db.prepare(`INSERT INTO orders (id, owner, request_key, payload, created_at, status, slot, total, packed, updated_at, phone, coupon)
+      SELECT ?, ?, ?, ?, ?, 'placed', ?, ?, '[]', ?, ?, ? WHERE EXISTS (SELECT 1 FROM payment_intents WHERE id = ? AND status = 'paid')
       AND NOT EXISTS (SELECT 1 FROM orders WHERE request_key = ?)`)
-      .bind(paidOrder.id, intent.owner, key, JSON.stringify(paidOrder), paidOrder.createdAt, paidOrder.slot, paidOrder.totals.total, now, intent.id, key),
+      .bind(paidOrder.id, intent.owner, key, JSON.stringify(paidOrder), paidOrder.createdAt, paidOrder.slot, paidOrder.totals.total, now, paidOrder.address.phone, paidOrder.coupon ?? '', intent.id, key),
     db.prepare(`INSERT INTO order_events (order_id, status, action, actor, note, created_at)
       SELECT ?, 'placed', 'placed', 'customer', 'Paid online with Razorpay', ?
       WHERE EXISTS (SELECT 1 FROM orders WHERE id = ?) AND NOT EXISTS (SELECT 1 FROM order_events WHERE order_id = ? AND action = 'placed')`)
@@ -190,7 +197,12 @@ async function finalizePayment(intent: PaymentIntentRow, paymentId: string): Pro
   ]);
   const saved = await getOrder(intent.id);
   if (!saved) {
-    const current = await getPaymentIntentByProviderOrder(intent.razorpay_order_id);
+    let current = await getPaymentIntentByProviderOrder(intent.razorpay_order_id);
+    // The hold ran out while the payment was being captured: release it so the refund below applies.
+    if (current?.status === 'pending' && current.expires_at <= nowIso()) {
+      await releaseExpiredIntent(current.id);
+      current = await getPaymentIntentByProviderOrder(intent.razorpay_order_id);
+    }
     if (current?.status === 'expired') {
       await refundPayment(paymentId, intent.amount);
       await markRefunded(intent.id, paymentId);
@@ -209,7 +221,13 @@ async function sendOrderNotifications(order: NonNullable<Awaited<ReturnType<type
 }
 
 export async function completePayment(razorpayOrderId: string, paymentId: string, signature: string, owner?: string) {
-  const intent = await getPaymentIntentByProviderOrder(razorpayOrderId);
+  let intent = await getPaymentIntentByProviderOrder(razorpayOrderId);
+  // Never capture money for a hold that has already run out (the stock may be sold to someone else).
+  // An authorised payment that is never captured is voided by Razorpay automatically.
+  if (intent?.status === 'pending' && intent.expires_at <= nowIso()) {
+    await releaseExpiredIntent(intent.id);
+    intent = await getPaymentIntentByProviderOrder(razorpayOrderId);
+  }
   if (!intent || (owner && intent.owner !== owner)) throw new HttpError(404, 'Payment order not found. Please restart checkout.');
   const { keySecret } = gatewayConfig();
   if (!await verifyRazorpaySignature(razorpayOrderId, paymentId, signature, keySecret)) {
@@ -267,7 +285,7 @@ export async function refundPaidOnlineOrder(order: OrderRecord): Promise<void> {
   await db.prepare("UPDATE orders SET payload = json_set(payload, '$.paymentStatus', 'refund_pending') WHERE id = ?")
     .bind(order.id).run();
   try {
-    const refund = await refundPayment(order.razorpayPaymentId, order.totals.total * 100);
+    const refund = await refundPayment(order.razorpayPaymentId, rupeesToPaise(order.totals.total));
     const status = refund.status === 'processed' ? 'refunded' : 'refund_pending';
     await db.prepare("UPDATE orders SET payload = json_set(payload, '$.paymentStatus', ?) WHERE id = ?")
       .bind(status, order.id).run();

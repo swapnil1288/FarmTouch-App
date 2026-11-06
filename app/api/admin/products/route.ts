@@ -33,7 +33,12 @@ const productSchema = z
   .refine((p) => p.mrp >= p.price, { message: 'MRP must be equal to or higher than the selling price' })
   .refine((p) => !p.active || !p.needsPriceReview, { message: 'Confirm the product price before publishing it.' });
 
-const stockSchema = z.object({ id: z.string(), stock: z.number().int().min(0).max(100000) }).strict();
+const stockNumber = z.number().int().min(0).max(100000);
+/** `expected` = the stock the staff member saw; the update is refused if orders changed it since. */
+const stockSchema = z.object({ id: z.string(), stock: stockNumber, expected: stockNumber.optional() }).strict();
+
+const stockChanged = (live: number) =>
+  new HttpError(409, `Stock changed to ${live} since you opened this page (orders reserve stock). Check the shelf count and save again.`);
 
 /**
  * POST { op: 'save', product }  – admin: create or update a product
@@ -41,14 +46,21 @@ const stockSchema = z.object({ id: z.string(), stock: z.number().int().min(0).ma
  */
 export async function POST(request: Request) {
   try {
-    const body = (await readJsonBody(request)) as { op?: string; product?: unknown; id?: unknown; stock?: unknown };
+    const body = (await readJsonBody(request)) as { op?: string; product?: unknown; id?: unknown; stock?: unknown; expected?: unknown; expectedStock?: unknown };
     const db = database();
     if (body.op === 'stock') {
       await requireStaff(['admin', 'packer']);
-      const s = stockSchema.safeParse({ id: body.id, stock: body.stock });
+      const s = stockSchema.safeParse({ id: body.id, stock: body.stock, expected: body.expected });
       if (!s.success) throw new HttpError(400, 'Enter a valid stock number (0 or more).');
-      const r = await db.prepare('UPDATE products SET stock = ?, updated_at = ? WHERE id = ?').bind(s.data.stock, nowIso(), s.data.id).run();
-      if (!r.meta.changes) throw new HttpError(404, 'Product not found.');
+      const { id, stock, expected } = s.data;
+      const r = expected === undefined
+        ? await db.prepare('UPDATE products SET stock = ?, updated_at = ? WHERE id = ?').bind(stock, nowIso(), id).run()
+        : await db.prepare('UPDATE products SET stock = ?, updated_at = ? WHERE id = ? AND stock = ?').bind(stock, nowIso(), id, expected).run();
+      if (!r.meta.changes) {
+        const live = await db.prepare('SELECT stock FROM products WHERE id = ?').bind(id).first<{ stock: number }>();
+        if (!live) throw new HttpError(404, 'Product not found.');
+        throw stockChanged(live.stock);
+      }
       return json({ products: await listProducts() });
     }
     if (body.op === 'save') {
@@ -56,16 +68,29 @@ export async function POST(request: Request) {
       const parsed = productSchema.safeParse(body.product);
       if (!parsed.success) throw new HttpError(400, parsed.error.issues[0]?.message ?? 'Check the product details.');
       const p = parsed.data;
-      await db
+      const expected = stockNumber.optional().safeParse(body.expectedStock);
+      if (!expected.success) throw new HttpError(400, 'Invalid stock.');
+      const expectedStock = expected.data ?? null;
+      // Editing an existing product: if the stock field was left alone, keep the LIVE stock
+      // (orders may have reserved some meanwhile). If it was changed, only apply it when the
+      // live stock is still what the form showed.
+      const keepLive = expectedStock !== null && p.stock === expectedStock ? 1 : 0;
+      const r = await db
         .prepare(
           `INSERT INTO products (id, name, local, unit, price, mrp, category, image, needs_price_review, stock, active, sort, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET name = excluded.name, local = excluded.local, unit = excluded.unit, price = excluded.price,
-             mrp = excluded.mrp, category = excluded.category, image = excluded.image, needs_price_review = excluded.needs_price_review, stock = excluded.stock,
-             active = excluded.active, sort = excluded.sort, updated_at = excluded.updated_at`,
+             mrp = excluded.mrp, category = excluded.category, image = excluded.image, needs_price_review = excluded.needs_price_review,
+             stock = CASE WHEN ?14 = 1 THEN products.stock ELSE excluded.stock END,
+             active = excluded.active, sort = excluded.sort, updated_at = excluded.updated_at
+           WHERE ?14 = 1 OR ?15 IS NULL OR products.stock = ?15`,
         )
-        .bind(p.id, p.name, p.local, p.unit, p.price, p.mrp, p.category, p.image, p.needsPriceReview ? 1 : 0, p.stock, p.active ? 1 : 0, p.sort, nowIso())
+        .bind(p.id, p.name, p.local, p.unit, p.price, p.mrp, p.category, p.image, p.needsPriceReview ? 1 : 0, p.stock, p.active ? 1 : 0, p.sort, nowIso(), keepLive, expectedStock)
         .run();
+      if (!r.meta.changes) {
+        const live = await db.prepare('SELECT stock FROM products WHERE id = ?').bind(p.id).first<{ stock: number }>();
+        throw stockChanged(live?.stock ?? 0);
+      }
       return json({ products: await listProducts() });
     }
     throw new HttpError(400, 'Unknown operation.');

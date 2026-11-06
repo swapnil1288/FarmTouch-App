@@ -20,6 +20,7 @@ type Config = { storeNumber: string; api: boolean; updateTemplate: string; offer
 
 const STATUS_TEXT: Record<string, string> = {
   queued: 'Sending…',
+  sending: 'Sending…',
   sent: 'Sent automatically',
   manual: 'Sent by staff',
   pending: 'To send',
@@ -186,7 +187,7 @@ export function WhatsAppView({ onTodoChange }: { onTodoChange: (n: number) => vo
                 </div>
                 <details><summary className="small">Message</summary><pre className="msg-preview">{n.message}</pre></details>
                 {n.error && n.status === 'failed' && <small className="bad-text">{n.error}</small>}
-                {(n.status === 'pending' || n.status === 'failed' || n.status === 'queued') && (
+                {(n.status === 'pending' || n.status === 'failed' || n.status === 'queued' || n.status === 'sending') && (
                   <div className="msg-actions">
                     <button className="btn btn-wa sm" onClick={async () => { if (await sendByHand(n)) reload(); }}><WhatsAppIcon size={14} /> Send on WhatsApp</button>
                     {c.api && n.status === 'failed' && (
