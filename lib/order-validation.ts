@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { BASKET_PREFIX, MAX_QTY, coupons, findBasketType, getSlots, packsNeeded, type Catalog } from './catalog';
+import { BASKET_PREFIX, MAX_QTY, findBasketType, getSlots, packsNeeded, pinProblem, type Catalog, type Slot } from './catalog';
 import { snapshotItems } from './orders';
 
 const line = z
@@ -10,26 +10,27 @@ const line = z
   })
   .strict();
 
-const couponCodes = ['', ...coupons.map((c) => c.code)] as [string, ...string[]];
-
 export const PHONE_PATTERN = /^[6-9]\d{9}$/;
-export const PIN_PATTERN = /^411\d{3}$/;
 
 export const addressSchema = z
   .object({
     name: z.string().trim().min(2, 'Enter your full name').max(100),
     street: z.string().trim().min(8, 'Enter your flat, building and street').max(300),
     phone: z.string().trim().regex(PHONE_PATTERN, 'Enter a valid 10-digit Indian mobile number'),
-    pin: z.string().trim().regex(PIN_PATTERN, 'We deliver to Pune postcodes (411xxx) only'),
+    // The delivery-area check (live pincode list) happens in validateOrder.
+    pin: z.string().trim().regex(/^\d{6}$/, 'Enter a 6-digit pincode'),
   })
   .strict();
+
+/** Live delivery rules from /admin → Store. Defaults = next 3 days, any 411xxx pincode. */
+export type StoreRules = { slots: Slot[]; pincodes: string[] | null };
 
 export type Address = z.infer<typeof addressSchema>;
 
 export const orderSchema = z
   .object({
     lines: z.array(line).min(1, 'Your cart is empty').max(30),
-    coupon: z.enum(couponCodes).default(''),
+    coupon: z.string().trim().toUpperCase().max(20).default(''),
     address: addressSchema,
     slot: z.string().max(40),
     payment: z.enum(['cod', 'online']),
@@ -60,10 +61,14 @@ function firstIssueMessage(error: z.ZodError): string {
  * totals plus an item snapshot (names/prices at the time of ordering).
  * Final stock is enforced again atomically in the database.
  */
-export function validateOrder(input: unknown, catalog: Catalog) {
+export function validateOrder(input: unknown, catalog: Catalog, rules: StoreRules = { slots: getSlots(), pincodes: null }) {
   const result = orderSchema.safeParse(input);
   if (!result.success) throw new OrderValidationError(firstIssueMessage(result.error));
   const b = result.data;
+
+  const pin = pinProblem(b.address.pin, rules.pincodes);
+  if (pin) throw new OrderValidationError(pin);
+  if (b.coupon && !catalog.findCoupon(b.coupon)) throw new OrderValidationError('This coupon is not valid or has expired.');
 
   const seen = new Set<string>();
   for (const l of b.lines) {
@@ -85,12 +90,13 @@ export function validateOrder(input: unknown, catalog: Catalog) {
     if (q > p.stock) throw new OrderValidationError(`Only ${p.stock} packs of ${p.name} are left.`);
   }
 
-  const slot = getSlots().find((s) => s.id === b.slot);
+  const slot = rules.slots.find((s) => s.id === b.slot);
   if (!slot) throw new OrderValidationError('That delivery slot is no longer available. Please choose another.');
+  if (slot.full) throw new OrderValidationError(`${slot.label.split(' · ')[0]} is fully booked. Please choose another delivery day.`);
 
   const totals = catalog.priceCart(b.lines, b.coupon);
   if (b.coupon && totals.discount === 0) {
-    const min = coupons.find((c) => c.code === b.coupon)?.min ?? 0;
+    const min = catalog.findCoupon(b.coupon)?.min ?? 0;
     throw new OrderValidationError(`${b.coupon} needs an item subtotal of ₹${min} or more.`);
   }
 

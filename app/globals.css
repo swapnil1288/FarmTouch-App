@@ -414,6 +414,8 @@ svg { flex-shrink: 0; }
 .slot-chips button strong { display: block; font-size: .9rem; }
 .slot-chips button small { color: var(--ft-muted); font-size: .76rem; }
 .slot-chips button.on { border-color: var(--ft-brand); background: var(--ft-brand-soft); }
+.slot-chips button:disabled { opacity: .55; cursor: not-allowed; border-style: dashed; }
+.slot-chips > p { grid-column: 1 / -1; color: var(--ft-muted); font-size: .85rem; }
 .choice { width: 100%; display: flex; align-items: center; gap: 12px; padding: 13px 14px; border: 1.5px solid var(--ft-line); border-radius: 12px; cursor: pointer; font-size: .9rem; }
 .choice input { width: 18px; height: 18px; accent-color: var(--ft-brand); flex: none; }
 .choice > svg { color: var(--ft-brand); }
@@ -843,6 +845,13 @@ p.small svg { vertical-align: -2px; }
 .adm-table tr.inactive td { opacity: .55; }
 .adm-table.compact td, .adm-table.compact th { padding: 6px 4px; }
 .adm-card .adm-table { margin-top: 4px; }
+/* /admin → Store */
+.store-inline { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin: 6px 0 10px; }
+.store-inline label { display: grid; gap: 4px; font-size: .8rem; font-weight: 600; flex: 1 1 160px; }
+.store-inline input, .adm-table td input { border: 1.5px solid var(--ft-line); border-radius: 10px; padding: 8px 10px; font: inherit; min-width: 0; width: 100%; background: #fff; }
+.adm-table td input.store-num { max-width: 120px; }
+.store-actions { white-space: nowrap; text-align: right; }
+.store-actions > * + * { margin-left: 6px; }
 .prod-cell { display: flex; align-items: center; gap: 10px; }
 .prod-cell img { width: 40px; height: 40px; object-fit: contain; background: #f8f9f7; border-radius: 8px; }
 .prod-cell small { display: block; color: var(--ft-muted); font-size: .74rem; }

@@ -5,7 +5,7 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   BarChart3, Banknote, Bike, Box, CalendarDays, Check, ClipboardList, Download, ExternalLink, Info, LoaderCircle,
   KeyRound, LogOut, MapPin, MessageCircle, Navigation, Package, PackageCheck, Pencil, Phone, Plus, Printer, RefreshCw, Search, ShoppingBasket,
-  Store, Truck, UserPlus, Users, X,
+  Settings, Store, Truck, UserPlus, Users, X,
 } from 'lucide-react';
 import Link from 'next/link';
 import { Toaster, toast } from 'sonner';
@@ -21,11 +21,12 @@ import { mapsLink, statusMessage, whatsappLink } from '@/lib/whatsapp';
 import { api } from './api';
 import { EditItemsDialog } from './edit-items';
 import { OrderMessages, SendPrompt, WhatsAppView, type Notice } from './messages';
+import { StoreSettingsView } from './store-settings';
 
 // ---------------------------------------------------------------- helpers
 
 type Me = { email: string; name: string; role: StaffRole; phone: string; via?: 'password' | 'platform' };
-type Tab = 'dashboard' | 'settlement' | 'orders' | 'packing' | 'dispatch' | 'deliveries' | 'whatsapp' | 'products' | 'staff';
+type Tab = 'dashboard' | 'settlement' | 'orders' | 'packing' | 'dispatch' | 'deliveries' | 'whatsapp' | 'products' | 'store' | 'staff';
 
 const TABS: { id: Tab; label: string; Icon: typeof Box; roles: StaffRole[] }[] = [
   { id: 'dashboard', label: 'Dashboard', Icon: BarChart3, roles: ['admin'] },
@@ -36,6 +37,7 @@ const TABS: { id: Tab; label: string; Icon: typeof Box; roles: StaffRole[] }[] =
   { id: 'deliveries', label: 'My deliveries', Icon: Bike, roles: ['delivery'] },
   { id: 'whatsapp', label: 'WhatsApp', Icon: MessageCircle, roles: ['admin'] },
   { id: 'products', label: 'Products', Icon: ShoppingBasket, roles: ['admin', 'packer'] },
+  { id: 'store', label: 'Store', Icon: Settings, roles: ['admin'] },
   { id: 'staff', label: 'Staff', Icon: Users, roles: ['admin'] },
 ];
 
@@ -170,6 +172,7 @@ export default function AdminApp({ me, whatsappNumber }: { me: Me; whatsappNumbe
         {tab === 'deliveries' && <MyDeliveries {...shared} />}
         {tab === 'whatsapp' && <WhatsAppView onTodoChange={setTodo} />}
         {tab === 'products' && <ProductsView me={me} />}
+        {tab === 'store' && <StoreSettingsView />}
         {tab === 'staff' && <StaffView me={me} onChanged={() => void loadPartners()} />}
       </main>
 
@@ -1113,11 +1116,15 @@ function ProductsView({ me }: { me: Me }) {
     const stock = Number(raw);
     if (!Number.isInteger(stock) || stock < 0) { toast.error('Stock must be 0 or more.'); return; }
     try {
-      const d = await api<{ products: Product[] }>('/api/admin/products', { op: 'stock', id: p.id, stock });
+      // `expected` = the number on screen; the server refuses if orders changed it meanwhile.
+      const d = await api<{ products: Product[] }>('/api/admin/products', { op: 'stock', id: p.id, stock, expected: p.stock });
       setProducts(d.products);
       setStockEdits((s) => { const n = { ...s }; delete n[p.id]; return n; });
       toast.success(`${p.name}: stock ${stock}`);
-    } catch (e) { toast.error((e as Error).message); }
+    } catch (e) {
+      toast.error((e as Error).message);
+      setTick((t) => t + 1); // show the live stock
+    }
   }
 
   async function saveProduct(e: React.FormEvent) {
@@ -1125,7 +1132,9 @@ function ProductsView({ me }: { me: Me }) {
     if (!editing) return;
     setSaving(true);
     try {
-      const d = await api<{ products: Product[] }>('/api/admin/products', { op: 'save', product: editing });
+      // Stock as it was when this form opened, so the server keeps live stock if it was not edited here.
+      const expectedStock = isNew ? undefined : products?.find((p) => p.id === editing.id)?.stock;
+      const d = await api<{ products: Product[] }>('/api/admin/products', { op: 'save', product: editing, expectedStock });
       if (isNew && products?.some((p) => p.id === editing.id.trim().toLowerCase())) toast.info('A product with this ID existed and was updated.');
       setProducts(d.products);
       setEditing(null);

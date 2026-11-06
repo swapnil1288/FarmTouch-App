@@ -47,3 +47,6 @@ next-env.d.ts
 
 # local secrets
 .dev.vars
+
+# TypeScript incremental build cache
+*.tsbuildinfo

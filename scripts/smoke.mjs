@@ -29,7 +29,7 @@ r = await post('/api/admin/setup', { code: SETUP_CODE, name: OWNER.name, email: 
 if (r.status === 409) r = await post('/api/admin/login', { login: OWNER.email, password: OWNER.password });
 assert.equal(r.status, 200, await r.clone().text());
 const owner = { cookie: cookieFrom(r) };
-assert.match(owner.cookie, /^ft_staff=[0-9a-f]{64}$/);
+assert.match(owner.cookie, /^ft_staff_admin=[0-9a-f]{64}$/);
 assert.match(await (await get('/admin', owner)).text(), /STAFF PANEL/);
 assert.equal((await post('/api/admin/login', { login: OWNER.email, password: 'nope-nope' })).status, 401);
 assert.equal((await get('/api/admin/me')).status, 401);
@@ -140,9 +140,13 @@ await ok(await post('/api/admin/staff', { email: packerEmail, name: 'QA Packer',
 await ok(await post('/api/admin/staff', { email: riderEmail, name: 'QA Rider', phone: riderPhone, role: 'delivery', active: true, password: 'Rider@1234' }, owner));
 assert.match((await (await post('/api/admin/staff', { email: 'x' + riderEmail, name: 'Dup', phone: riderPhone, role: 'delivery', active: true, password: 'Rider@1234' }, owner)).json()).error, /already used/);
 assert.equal((await post('/api/admin/staff', { email: OWNER.email, name: 'Me', phone: '', role: 'packer', active: true }, owner)).status, 400);
-const loginAs = async (login, password) => { const res = await post('/api/admin/login', { login, password }); assert.equal(res.status, 200, await res.clone().text()); return { cookie: cookieFrom(res) }; };
+const loginAs = async (login, password, portal = 'admin') => {
+  const res = await post('/api/admin/login', { login, password, portal });
+  assert.equal(res.status, 200, await res.clone().text());
+  return portal === 'rider' ? { cookie: cookieFrom(res), 'x-staff-portal': 'rider' } : { cookie: cookieFrom(res) };
+};
 const packer = await loginAs(packerEmail, 'Packer@123');
-const rider = await loginAs(riderPhone, 'Rider@1234'); // phone login
+const rider = await loginAs(riderPhone, 'Rider@1234', 'rider'); // phone login, rider portal
 assert.equal((await get('/api/admin/reports', packer)).status, 403);
 assert.equal((await get('/api/admin/messages', packer)).status, 403);
 assert.equal((await post('/api/admin/products', { op: 'save', product: { id: 'x' } }, packer)).status, 403);
@@ -152,6 +156,13 @@ const lockEmail = `lock-${run}@example.test`;
 await ok(await post('/api/admin/staff', { email: lockEmail, name: 'Lock Test', phone: '', role: 'packer', active: true, password: 'Locked@123' }, owner));
 for (let i = 0; i < 5; i++) assert.equal((await post('/api/admin/login', { login: lockEmail, password: 'wrong-' + i })).status, 401);
 assert.equal((await post('/api/admin/login', { login: lockEmail, password: 'Locked@123' })).status, 429);
+// parallel guesses cannot get more than 5 password checks past the lockout
+const burstEmail = `burst-${run}@example.test`;
+await ok(await post('/api/admin/staff', { email: burstEmail, name: 'Burst Test', phone: '', role: 'packer', active: true, password: 'Burst@1234' }, owner));
+const burst = await Promise.all(Array.from({ length: 10 }, (_, i) => post('/api/admin/login', { login: burstEmail, password: 'wrong-' + i }).then((x) => x.status)));
+assert.ok(burst.filter((s) => s === 401).length <= 5, 'parallel guesses: ' + burst.join(','));
+assert.ok(burst.every((s) => s === 401 || s === 429), 'parallel guesses: ' + burst.join(','));
+assert.equal((await post('/api/admin/login', { login: burstEmail, password: 'Burst@1234' })).status, 429);
 // disabling a staff member ends their sessions
 const tmp = await loginAs(packerEmail, 'Packer@123');
 await ok(await post('/api/admin/staff', { email: packerEmail, name: 'QA Packer', phone: '', role: 'packer', active: false }, owner));
@@ -160,6 +171,7 @@ await ok(await post('/api/admin/staff', { email: packerEmail, name: 'QA Packer',
 const packer2 = await loginAs(packerEmail, 'Packer@456');
 // change own password
 await ok(await post('/api/admin/password', { current: 'Packer@456', next: 'Packer@789' }, packer2));
+assert.equal((await get('/api/admin/me', packer2)).status, 200, 'changing your password keeps this device signed in');
 assert.equal((await post('/api/admin/login', { login: packerEmail, password: 'Packer@456' })).status, 401);
 const packer3 = await loginAs(packerEmail, 'Packer@789');
 // logout
@@ -254,5 +266,117 @@ const saved = await ok(await post('/api/admin/products', { op: 'save', product: 
 assert.ok(saved.products.some((p) => p.id === 'qa-gobi'));
 assert.ok(!('qa-gobi' in (await stock())));
 assert.equal((await ok(await get('/api/orders', who('qa-buyer-c-' + run, 'c@example.test')))).orders.length, 0);
+
+// ---------------------------------------------------------------- stock counts cannot overwrite reservations
+await ok(await post('/api/admin/products', { op: 'stock', id: 'qa-gobi', stock: 5 }, owner));
+await ok(await post('/api/admin/products', { op: 'stock', id: 'qa-gobi', stock: 7, expected: 5 }, owner));
+const stale = await post('/api/admin/products', { op: 'stock', id: 'qa-gobi', stock: 9, expected: 5 }, owner); // screen still shows 5
+assert.equal(stale.status, 409, await stale.clone().text());
+assert.match((await stale.json()).error, /changed to 7/);
+const gobi = { id: 'qa-gobi', name: 'Cauliflower', local: 'Phool gobi', unit: '1 pc', price: 30, mrp: 40, category: 'Vegetables', image: 'basket', active: false, sort: 99 };
+// Editing other fields with the old stock on screen keeps the live stock (7), not the stale 5.
+await ok(await post('/api/admin/products', { op: 'save', product: { ...gobi, name: 'Cauliflower (big)', stock: 5 }, expectedStock: 5 }, owner));
+let live = (await ok(await get('/api/admin/products', owner))).products.find((p) => p.id === 'qa-gobi');
+assert.equal(live.stock, 7);
+assert.equal(live.name, 'Cauliflower (big)');
+// Changing the stock field from a stale form is refused.
+assert.equal((await post('/api/admin/products', { op: 'save', product: { ...gobi, stock: 20 }, expectedStock: 5 }, owner)).status, 409);
+await ok(await post('/api/admin/products', { op: 'save', product: { ...gobi, stock: 20 }, expectedStock: 7 }, owner));
+live = (await ok(await get('/api/admin/products', owner))).products.find((p) => p.id === 'qa-gobi');
+assert.equal(live.stock, 20);
+
+// ---------------------------------------------------------------- per-IP rate limit (tracking: 30 per 10 minutes)
+const ipHeaders = { 'cf-connecting-ip': `203.0.113.${Math.floor(Math.random() * 250) + 1}-${run}` };
+const trackStatuses = [];
+for (let i = 0; i < 31; i++) trackStatuses.push((await get('/api/orders/track?id=FT-00000000&phone=9000000000', ipHeaders)).status);
+assert.ok(trackStatuses.slice(0, 30).every((s) => s === 404), 'first 30 allowed: ' + trackStatuses.join(','));
+assert.equal(trackStatuses[30], 429, 'the 31st is limited');
+assert.equal((await get('/api/orders/track?id=FT-00000000&phone=9000000000', { 'cf-connecting-ip': '198.51.100.7-' + run })).status, 404, 'other IPs are not affected');
+
+// ---------------------------------------------------------------- store rules: coupons, delivery days, pincodes
+{
+  const S = async (b) => ok(await post('/api/admin/store', b, owner));
+  assert.equal((await get('/api/admin/store', rider)).status, 403, 'store settings are admin-only');
+  const liveCatalog = async () => ok(await get('/api/catalog'));
+  const tag = run.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(-8);
+  const phone = (n) => '7' + (String(Date.now()).slice(-8) + n).slice(-9); // 10 digits
+  const pastDay = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+  const coupon = (code, rules) => S({ op: 'coupon', code, title: 'QA ' + code, amount: 40, min: 100, active: true, expiresOn: null, firstOrderOnly: false, perCustomer: 0, maxUses: 0, ...rules });
+  await ok(await post('/api/admin/products', { op: 'stock', id: 'apple', stock: 50 }, owner));
+  let cat = await liveCatalog();
+  const place = (extra, phoneNo, more = {}) => order({
+    ...body, lines: [{ id: 'apple', qty: 2 }], address: { ...body.address, phone: phoneNo }, slot: cat.slots[0].id,
+    requestKey: `qa-store-${run}-${extra}`, ...more,
+  });
+  const errorOf = async (res, status) => { assert.equal(res.status, status, await res.clone().text()); return (await res.json()).error; };
+
+  // once per customer — and a cancelled order gives the coupon back
+  const once = 'QAONE' + tag;
+  await coupon(once, { perCustomer: 1 });
+  cat = await liveCatalog();
+  assert.ok(cat.coupons.some((c) => c.code === once && c.perCustomer === 1), 'new coupon is offered');
+  const pA = phone(1);
+  const first = await ok(await place('once-1', pA, { coupon: once }), 201);
+  assert.equal(first.order.totals.discount, 40);
+  assert.match(await errorOf(await place('once-2', pA, { coupon: once }), 409), /already used/);
+  await ok(await post('/api/orders/cancel', { id: first.order.id }, buyer));
+  await ok(await place('once-3', pA, { coupon: once.toLowerCase() }), 201);
+
+  // expired coupons disappear from the shop and are refused
+  await coupon(once, { perCustomer: 1, expiresOn: pastDay });
+  assert.ok(!(await liveCatalog()).coupons.some((c) => c.code === once));
+  assert.match(await errorOf(await place('expired', phone(2), { coupon: once }), 400), /not valid or has expired/);
+
+  // first order only (pA already has an order)
+  const firstOnly = 'QAFIRST' + tag;
+  await coupon(firstOnly, { firstOrderOnly: true });
+  cat = await liveCatalog();
+  assert.match(await errorOf(await place('first-1', pA, { coupon: firstOnly }), 409), /first order/);
+  await ok(await place('first-2', phone(3), { coupon: firstOnly }), 201);
+
+  // total uses
+  const limited = 'QAMAX' + tag;
+  await coupon(limited, { maxUses: 1 });
+  cat = await liveCatalog();
+  await ok(await place('max-1', phone(4), { coupon: limited }), 201);
+  assert.match(await errorOf(await place('max-2', phone(5), { coupon: limited }), 409), /fully claimed/);
+  const admin = await ok(await get('/api/admin/store', owner));
+  assert.equal(admin.coupons.find((c) => c.code === limited).uses, 1, 'admin sees usage');
+
+  // delivery pincodes
+  const before = admin.pincodes;
+  await S({ op: 'pincode', pin: '411045', area: 'QA Baner', active: true });
+  cat = await liveCatalog();
+  assert.ok(cat.pincodes.includes('411045'));
+  if (!before.some((p) => p.pin === '411099' && p.active)) {
+    assert.match(await errorOf(await place('pin-1', phone(6), { address: { ...body.address, phone: phone(6), pin: '411099' } }), 400), /do not deliver to 411099/);
+  }
+  await ok(await place('pin-2', phone(7), { address: { ...body.address, phone: phone(7), pin: '411045' } }), 201);
+  if (!before.some((p) => p.pin === '411045')) await S({ op: 'pincode_delete', pin: '411045' });
+
+  // closed day: not offered, and refused if a stale page still sends it
+  const day = cat.slots[0].id.slice(0, 10);
+  const daySlot = cat.slots[0].id;
+  await S({ op: 'day', date: day, closed: true, capacity: null, note: 'QA closed' });
+  cat = await liveCatalog();
+  assert.ok(!cat.slots.some((s) => s.id === daySlot), 'closed day not offered');
+  assert.equal(cat.slots.length, admin.settings.slotDays, 'the next open day takes its place');
+  assert.match(await errorOf(await place('closed', phone(8), { slot: daySlot }), 400), /no longer available/);
+
+  // capacity: room for exactly one more order, then "fully booked"
+  const booked = (await ok(await get('/api/admin/store', owner))).days.find((d) => d.date === day).booked;
+  await S({ op: 'day', date: day, closed: false, capacity: booked + 1, note: '' });
+  cat = await liveCatalog();
+  assert.ok(!cat.slots.find((s) => s.id === daySlot).full);
+  await ok(await place('cap-1', phone(9), { slot: daySlot }), 201);
+  cat = await liveCatalog();
+  assert.equal(cat.slots.find((s) => s.id === daySlot).full, true, 'day shows as fully booked');
+  assert.match(await errorOf(await place('cap-2', phone(0), { slot: daySlot }), 400), /fully booked/);
+
+  // clean up: the dev server shares this local database
+  await S({ op: 'day', date: day, closed: false, capacity: null, note: '' });
+  assert.ok(!(await liveCatalog()).slots.find((s) => s.id === daySlot).full);
+  for (const code of [firstOnly, limited]) await coupon(code, { active: false });
+}
 
 console.log('PASS: staff login/setup/lockout/password/logout, guest ordering + tracking, stock reservation & races, cancel + restock, item changes with stock & new total, full workflow, WhatsApp message log (placed/confirmed/changed/out for delivery/delivered+payment/cancelled), consent, offers, reports, CSV, products and isolation.');

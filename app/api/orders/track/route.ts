@@ -1,5 +1,6 @@
 import { getOrder } from '@/lib/server/orders';
 import { HttpError, errorResponse, json } from '@/lib/server/http';
+import { rateLimit } from '@/lib/server/rate-limit';
 
 /**
  * Public order tracking: GET ?id=FT-XXXXXXXX&phone=98XXXXXXXX
@@ -7,6 +8,7 @@ import { HttpError, errorResponse, json } from '@/lib/server/http';
  */
 export async function GET(request: Request) {
   try {
+    await rateLimit(request, 'track');
     const url = new URL(request.url);
     const id = (url.searchParams.get('id') ?? '').trim().toUpperCase();
     const phone = (url.searchParams.get('phone') ?? '').replace(/\D/g, '').slice(-10);

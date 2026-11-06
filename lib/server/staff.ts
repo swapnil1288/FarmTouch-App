@@ -108,16 +108,31 @@ export async function checkLogin(login: string, password: string): Promise<Staff
       ? await db.prepare('SELECT * FROM staff WHERE phone = ? ORDER BY active DESC LIMIT 1').bind(phone).first<StaffRow>()
       : null;
 
-  const now = nowIso();
-  if (row?.locked_until && row.locked_until > now) {
-    throw new HttpError(429, 'Too many wrong passwords. Please wait 15 minutes or ask the owner to reset your password.');
+  const lockedError = new HttpError(429, 'Too many wrong passwords. Please wait 15 minutes or ask the owner to reset your password.');
+  // Reserve this attempt atomically BEFORE checking the password, so parallel guesses
+  // cannot all read the same counter and slip past the limit.
+  let attempt: { failed_logins: number } | null = null;
+  if (row) {
+    attempt = await db
+      .prepare(`UPDATE staff SET failed_logins = failed_logins + 1
+        WHERE email = ? AND (locked_until IS NULL OR locked_until <= ?) AND failed_logins < ? RETURNING failed_logins`)
+      .bind(row.email, nowIso(), MAX_FAILED)
+      .first<{ failed_logins: number }>();
+    if (!attempt) {
+      // Counter is full but no lock was written (e.g. a request died midway): turn it into a normal 15-minute lock.
+      const now = nowIso();
+      await db
+        .prepare('UPDATE staff SET failed_logins = 0, locked_until = ? WHERE email = ? AND failed_logins >= ? AND (locked_until IS NULL OR locked_until <= ?)')
+        .bind(new Date(Date.now() + LOCK_MINUTES * 60000).toISOString(), row.email, MAX_FAILED, now)
+        .run();
+      throw lockedError;
+    }
   }
   const ok = await verifyPassword(password, row?.password_hash ?? '');
   if (!row || !ok || !row.active) {
-    if (row) {
-      const failed = row.failed_logins + 1;
-      const lock = failed >= MAX_FAILED ? new Date(Date.now() + LOCK_MINUTES * 60000).toISOString() : null;
-      await db.prepare('UPDATE staff SET failed_logins = ?, locked_until = ? WHERE email = ?').bind(lock ? 0 : failed, lock, row.email).run();
+    if (row && attempt && attempt.failed_logins >= MAX_FAILED) {
+      const lock = new Date(Date.now() + LOCK_MINUTES * 60000).toISOString();
+      await db.prepare('UPDATE staff SET failed_logins = 0, locked_until = ? WHERE email = ?').bind(lock, row.email).run();
     }
     if (row && ok && !row.active) throw new HttpError(403, 'This account is disabled. Please contact the owner.');
     throw new HttpError(401, 'Wrong email/phone or password.');

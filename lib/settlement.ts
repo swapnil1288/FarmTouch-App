@@ -41,6 +41,40 @@ type SettlementOrder = {
 
 type CustomerAccount = { accountType: 'retail' | 'b2b'; businessName: string };
 
+type MoneyFields = Pick<SettlementOrder, 'status' | 'payment' | 'paymentStatus' | 'cashCollected' | 'totals'>;
+
+/**
+ * Where one order's money stands. The single source of truth for settlement,
+ * the dashboard and the customer ledger.
+ *   cashCollected     – cash/UPI the rider recorded on delivery (COD only)
+ *   onlinePaid        – captured online payment not yet refunded
+ *   pendingCollection – still owed by the customer (never for cancelled or paid-online orders)
+ */
+export function paymentBreakdown(o: MoneyFields): { cashCollected: number; onlinePaid: number; pendingCollection: number } {
+  const paidOnline = o.payment === 'online' && o.paymentStatus === 'paid';
+  return {
+    cashCollected: o.status === 'delivered' && o.payment !== 'online' ? (o.cashCollected ?? 0) : 0,
+    onlinePaid: paidOnline ? o.totals.total : 0,
+    pendingCollection: o.status === 'cancelled' || paidOnline ? 0 : Math.max(0, o.totals.total - (o.cashCollected ?? 0)),
+  };
+}
+
+/** Totals for a group of orders. */
+function sumUp(list: SettlementOrder[]) {
+  const live = list.filter((o) => o.status !== 'cancelled');
+  const money = list.map(paymentBreakdown);
+  const sum = (pick: (m: ReturnType<typeof paymentBreakdown>) => number) => money.reduce((n, m) => n + pick(m), 0);
+  return {
+    grossSales: live.reduce((n, o) => n + o.totals.total, 0),
+    discounts: live.reduce((n, o) => n + (o.totals.discount ?? 0), 0),
+    deliveryRevenue: live.reduce((n, o) => n + (o.totals.delivery ?? 0), 0),
+    cashCollected: sum((m) => m.cashCollected),
+    onlinePaid: sum((m) => m.onlinePaid),
+    pendingCollection: sum((m) => m.pendingCollection),
+    cancelledValue: list.filter((o) => o.status === 'cancelled').reduce((n, o) => n + o.totals.total, 0),
+  };
+}
+
 function indiaDate(date: Date): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
@@ -61,68 +95,33 @@ export function settlementSummary(orders: SettlementOrder[], days = 30, customer
   const toIso = new Date(`${today}T23:59:59.999+05:30`).toISOString();
   const window = orders.filter((o) => o.createdAt >= fromIso && o.createdAt <= toIso);
 
-  const grossSales = window.filter((o) => o.status !== 'cancelled').reduce((n, o) => n + o.totals.total, 0);
-  const discounts = window.filter((o) => o.status !== 'cancelled').reduce((n, o) => n + (o.totals.discount ?? 0), 0);
-  const deliveryRevenue = window.filter((o) => o.status !== 'cancelled').reduce((n, o) => n + (o.totals.delivery ?? 0), 0);
-  const cashCollected = window.filter((o) => o.status === 'delivered' && o.payment !== 'online').reduce((n, o) => n + (o.cashCollected ?? 0), 0);
-  const onlinePaid = window.filter((o) => o.payment === 'online' && o.paymentStatus === 'paid').reduce((n, o) => n + o.totals.total, 0);
-  const pendingCollection = window.filter((o) => o.status !== 'cancelled' && !(o.payment === 'online' && o.paymentStatus === 'paid'))
-    .reduce((n, o) => n + Math.max(0, o.totals.total - (o.cashCollected ?? 0)), 0);
-  const cancelledValue = window.filter((o) => o.status === 'cancelled').reduce((n, o) => n + o.totals.total, 0);
-
-  const byType: SettlementSummary['byType'] = {
-    b2b: { orders: 0, grossSales: 0, discounts: 0, deliveryRevenue: 0, cashCollected: 0, onlinePaid: 0, pendingCollection: 0, cancelledValue: 0, netSettlement: 0 },
-    retail: { orders: 0, grossSales: 0, discounts: 0, deliveryRevenue: 0, cashCollected: 0, onlinePaid: 0, pendingCollection: 0, cancelledValue: 0, netSettlement: 0 },
+  const accountOf = (o: SettlementOrder) => customerAccounts[o.customerPhone];
+  const typeOf = (o: SettlementOrder): 'b2b' | 'retail' => (accountOf(o)?.accountType === 'b2b' ? 'b2b' : 'retail');
+  const group = (list: SettlementOrder[]): SettlementGroup => {
+    const t = sumUp(list);
+    return { orders: list.length, ...t, netSettlement: t.cashCollected + t.onlinePaid + t.pendingCollection };
   };
-  for (const order of window) {
-    const accountType = customerAccounts[order.customerPhone]?.accountType === 'b2b' ? 'b2b' : 'retail';
-    const group = byType[accountType];
-    group.orders += 1;
-    if (order.status === 'cancelled') group.cancelledValue += order.totals.total;
-    else {
-      group.grossSales += order.totals.total;
-      group.discounts += order.totals.discount ?? 0;
-      group.deliveryRevenue += order.totals.delivery ?? 0;
-      if (order.payment === 'online' && order.paymentStatus === 'paid') group.onlinePaid += order.totals.total;
-      else group.pendingCollection += Math.max(0, order.totals.total - (order.cashCollected ?? 0));
-    }
-    if (order.status === 'delivered' && order.payment !== 'online') group.cashCollected += order.cashCollected ?? 0;
-  }
-  for (const group of Object.values(byType)) group.netSettlement = group.cashCollected + group.onlinePaid + group.pendingCollection;
 
-  const byDay: SettlementSummary['byDay'] = [];
-  const datesWithOrders = new Set(window.map((o) => indiaDate(new Date(o.createdAt))));
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(`${today}T00:00:00+05:30`);
-    d.setUTCDate(d.getUTCDate() - i);
-    const date = indiaDate(d);
-    if (!datesWithOrders.has(date)) continue;
-    const dayOrders = window.filter((o) => indiaDate(new Date(o.createdAt)) === date);
-    byDay.push({
-      date,
-      grossSales: dayOrders.filter((o) => o.status !== 'cancelled').reduce((n, o) => n + o.totals.total, 0),
-      discounts: dayOrders.filter((o) => o.status !== 'cancelled').reduce((n, o) => n + (o.totals.discount ?? 0), 0),
-      deliveryRevenue: dayOrders.filter((o) => o.status !== 'cancelled').reduce((n, o) => n + (o.totals.delivery ?? 0), 0),
-      cashCollected: dayOrders.filter((o) => o.status === 'delivered' && o.payment !== 'online').reduce((n, o) => n + (o.cashCollected ?? 0), 0),
-      onlinePaid: dayOrders.filter((o) => o.payment === 'online' && o.paymentStatus === 'paid').reduce((n, o) => n + o.totals.total, 0),
-      pendingCollection: dayOrders.filter((o) => o.status !== 'cancelled' && !(o.payment === 'online' && o.paymentStatus === 'paid'))
-        .reduce((n, o) => n + Math.max(0, o.totals.total - (o.cashCollected ?? 0)), 0),
-      cancelledValue: dayOrders.filter((o) => o.status === 'cancelled').reduce((n, o) => n + o.totals.total, 0),
-    });
+  const totals = sumUp(window);
+  const byType: SettlementSummary['byType'] = {
+    b2b: group(window.filter((o) => typeOf(o) === 'b2b')),
+    retail: group(window.filter((o) => typeOf(o) === 'retail')),
+  };
+
+  // One row per India date that has orders, oldest first.
+  const byDate = new Map<string, SettlementOrder[]>();
+  for (const o of window) {
+    const date = indiaDate(new Date(o.createdAt));
+    byDate.set(date, [...(byDate.get(date) ?? []), o]);
   }
+  const byDay: SettlementSummary['byDay'] = [...byDate.keys()].sort().map((date) => ({ date, ...sumUp(byDate.get(date)!) }));
 
   return {
     days,
     from: fromIso.slice(0, 10),
     to: toIso.slice(0, 10),
-    grossSales,
-    discounts,
-    deliveryRevenue,
-    cashCollected,
-    onlinePaid,
-    pendingCollection,
-    cancelledValue,
-    netSettlement: cashCollected + onlinePaid + pendingCollection,
+    ...totals,
+    netSettlement: totals.cashCollected + totals.onlinePaid + totals.pendingCollection,
     byType,
     orders: window.map((o) => ({
       id: o.id,
@@ -130,15 +129,13 @@ export function settlementSummary(orders: SettlementOrder[], days = 30, customer
       status: o.status,
       total: o.totals.total,
       discount: o.status === 'cancelled' ? 0 : (o.totals.discount ?? 0),
-      cashCollected: o.status === 'delivered' ? (o.cashCollected ?? 0) : 0,
-      onlinePaid: o.payment === 'online' && o.paymentStatus === 'paid' ? o.totals.total : 0,
-      pendingCollection: o.status === 'cancelled' || (o.payment === 'online' && o.paymentStatus === 'paid') ? 0 : Math.max(0, o.totals.total - (o.cashCollected ?? 0)),
+      ...paymentBreakdown(o),
       payment: o.payment,
       paymentStatus: o.paymentStatus,
       customerName: o.customerName,
       customerPhone: o.customerPhone,
-      accountType: customerAccounts[o.customerPhone]?.accountType === 'b2b' ? 'b2b' : 'retail',
-      businessName: customerAccounts[o.customerPhone]?.businessName ?? '',
+      accountType: typeOf(o),
+      businessName: accountOf(o)?.businessName ?? '',
     })),
     byDay,
   };

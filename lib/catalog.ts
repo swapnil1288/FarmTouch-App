@@ -61,11 +61,30 @@ export const MAX_QTY = 10;
 export const FREE_DELIVERY_MIN = 699;
 export const DELIVERY_FEE = 20;
 
-export type Coupon = { code: string; amount: number; min: number; title: string };
-export const coupons: Coupon[] = [
+/**
+ * A flat ₹ discount on the item total. Coupons are LIVE data managed in /admin → Store;
+ * the list passed around is already filtered to active, unexpired coupons.
+ */
+export type Coupon = {
+  code: string;
+  amount: number;
+  min: number;
+  title: string;
+  /** ISO time after which the coupon stops working (null = no expiry). */
+  expiresAt?: string | null;
+  /** Only for a customer's first (non-cancelled) order, by mobile number. */
+  firstOrderOnly?: boolean;
+  /** Times one mobile number may use it (0 = unlimited). */
+  perCustomer?: number;
+};
+
+/** Starter coupons – also seeded into the database by the migration. Used by tests and as a fallback. */
+export const DEFAULT_COUPONS: Coupon[] = [
   { code: 'FRESH50', amount: 50, min: 499, title: 'A fresh start' },
   { code: 'BASKET75', amount: 75, min: 799, title: 'Stock up & save' },
 ];
+
+export const COUPON_CODE_PATTERN = /^[A-Z0-9]{3,20}$/;
 
 export type Line = { id: string; qty: number; components?: string[] };
 export type Totals = { subtotal: number; discount: number; delivery: number; total: number };
@@ -78,13 +97,14 @@ export function findBasketType(lineId: string): BasketType | undefined {
   return basketTypes.find((b) => BASKET_PREFIX + b.id === lineId);
 }
 
-export function couponDiscount(code: string, subtotal: number): number {
-  const coupon = coupons.find((c) => c.code === code);
-  return coupon && subtotal >= coupon.min ? coupon.amount : 0;
+export function couponDiscount(code: string, subtotal: number, list: Coupon[] = DEFAULT_COUPONS): number {
+  const coupon = code ? list.find((c) => c.code === code) : undefined;
+  // Never more than the item total.
+  return coupon && subtotal >= coupon.min ? Math.min(coupon.amount, subtotal) : 0;
 }
 
-export function totalsFor(subtotal: number, coupon = ''): Totals {
-  const discount = couponDiscount(coupon, subtotal);
+export function totalsFor(subtotal: number, coupon = '', list: Coupon[] = DEFAULT_COUPONS): Totals {
+  const discount = couponDiscount(coupon, subtotal, list);
   const delivery = subtotal === 0 ? 0 : subtotal >= FREE_DELIVERY_MIN ? 0 : DELIVERY_FEE;
   return { subtotal, discount, delivery, total: subtotal - discount + delivery };
 }
@@ -104,8 +124,10 @@ export function packsNeeded(lines: Line[]): Record<string, number> {
   return out;
 }
 
-/** All pricing helpers bound to one product list (the live catalogue). */
-export function createCatalog(list: Product[]) {
+/** All pricing helpers bound to one product list and one coupon list (the live catalogue). */
+export function createCatalog(list: Product[], couponList: Coupon[] = DEFAULT_COUPONS) {
+  const coupons = couponList;
+  const findCoupon = (code: string) => coupons.find((c) => c.code === code.trim().toUpperCase());
   const byId = new Map(list.map((p) => [p.id, p]));
   const sorted = [...list].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name));
   /** Products a customer can see. */
@@ -138,7 +160,7 @@ export function createCatalog(list: Product[]) {
   }
 
   function priceCart(lines: Line[], coupon = ''): Totals {
-    return totalsFor(lines.reduce((sum, l) => sum + linePrice(l) * l.qty, 0), coupon);
+    return totalsFor(lines.reduce((sum, l) => sum + linePrice(l) * l.qty, 0), coupon, coupons);
   }
 
   function mrpSavings(lines: Line[]): number {
@@ -160,7 +182,7 @@ export function createCatalog(list: Product[]) {
     return isBasketId(l.id) ? findBasketType(l.id)?.name ?? 'Basket' : byId.get(l.id)?.name ?? l.id;
   }
 
-  return { products: sorted, visible, available, find, isBuyable, defaultBasket, basketPrice, linePrice, priceCart, mrpSavings, search, lineName };
+  return { products: sorted, visible, available, find, isBuyable, defaultBasket, basketPrice, linePrice, priceCart, mrpSavings, search, lineName, coupons, findCoupon };
 }
 
 export type Catalog = ReturnType<typeof createCatalog>;
@@ -170,7 +192,17 @@ export type Catalog = ReturnType<typeof createCatalog>;
 const IST_OFFSET_MS = 330 * 60 * 1000;
 const slotFormatter = new Intl.DateTimeFormat('en-IN', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Asia/Kolkata' });
 
-export type Slot = { id: string; label: string };
+export type Slot = {
+  id: string;
+  label: string;
+  /** No capacity left: shown but cannot be chosen. */
+  full?: boolean;
+};
+
+/** Default number of delivery days offered (when nothing is set in /admin → Store). */
+export const DEFAULT_SLOT_DAYS = 3;
+/** How far ahead to look for open days when some are closed. */
+const SLOT_LOOKAHEAD_DAYS = 14;
 
 /** India calendar date (YYYY-MM-DD) for a moment in time. */
 export function istDate(now: Date = new Date(), offsetDays = 0): string {
@@ -185,10 +217,35 @@ export function labelForSlotId(id: string): string {
   return `${slotFormatter.format(day)} · 9 AM – 12 PM`;
 }
 
-/** Next three morning slots, calculated on the India calendar date. */
-export function getSlots(now: Date = new Date()): Slot[] {
-  return [1, 2, 3].map((offset) => {
-    const id = `${istDate(now, offset)}-morning`;
-    return { id, label: labelForSlotId(id) };
-  });
+/**
+ * The next `days` open morning slots from tomorrow, on the India calendar date.
+ * Closed dates (YYYY-MM-DD) are skipped, looking up to two weeks ahead.
+ */
+export function getSlots(now: Date = new Date(), opts: { days?: number; closed?: Iterable<string> } = {}): Slot[] {
+  const days = opts.days ?? DEFAULT_SLOT_DAYS;
+  const closed = new Set(opts.closed ?? []);
+  const out: Slot[] = [];
+  for (let offset = 1; offset <= SLOT_LOOKAHEAD_DAYS && out.length < days; offset++) {
+    const date = istDate(now, offset);
+    if (closed.has(date)) continue;
+    const id = `${date}-morning`;
+    out.push({ id, label: labelForSlotId(id) });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- delivery area
+
+/** Used while no pincode list is set up in /admin → Store: any Pune postcode. */
+export const DEFAULT_PIN_PATTERN = /^411\d{3}$/;
+
+/**
+ * Why we cannot deliver to this pincode, or null if we can.
+ * `pincodes` = the shop's delivery list; null or empty means "any 411xxx".
+ */
+export function pinProblem(pin: string, pincodes: readonly string[] | null | undefined): string | null {
+  const p = pin.trim();
+  if (!/^\d{6}$/.test(p)) return 'Enter a 6-digit pincode.';
+  if (pincodes?.length) return pincodes.includes(p) ? null : `Sorry, we do not deliver to ${p} yet.`;
+  return DEFAULT_PIN_PATTERN.test(p) ? null : 'We deliver to Pune postcodes (411xxx) only.';
 }

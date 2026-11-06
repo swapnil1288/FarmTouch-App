@@ -14,9 +14,13 @@ import { Toaster, toast } from 'sonner';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { WhatsAppIcon } from '@/components/store/whatsapp-icon';
 import {
-  BASKET_PREFIX, FREE_DELIVERY_MIN, MAX_QTY, basketTypes, categories, coupons, createCatalog, discountPercent, productImagePath,
-  findBasketType, getSlots, isBasketId, packsNeeded, type Catalog, type Line, type Product, type Slot, type Totals,
+  BASKET_PREFIX, FREE_DELIVERY_MIN, MAX_QTY, basketTypes, categories, createCatalog, discountPercent, productImagePath,
+  findBasketType, isBasketId, packsNeeded, pinProblem, type Catalog, type Coupon, type Line, type Product, type Slot, type Totals,
 } from '@/lib/catalog';
+
+/** Live shop rules from the server: coupons, delivery days and delivery pincodes (null = any 411xxx). */
+type StoreInfo = { coupons: Coupon[]; slots: Slot[]; pincodes: string[] | null };
+type CatalogResponse = Partial<StoreInfo> & { products?: Product[] };
 import { snapshotItems, type OrderRecord } from '@/lib/orders';
 import { CUSTOMER_CANCELLABLE, STATUS_HINT, STATUS_LABEL, TRACK_STEPS, trackIndex, type OrderStatus } from '@/lib/workflow';
 import { SUPPORT_MESSAGE, buildOrderMessage, productShareMessage, whatsappLink } from '@/lib/whatsapp';
@@ -54,16 +58,23 @@ declare global {
 const EMPTY_ADDRESS: Address = { name: '', phone: '', street: '', pin: '' };
 const DRAFT_KEY = 'farmtouch-draft-v2';
 const PHONE_RE = /^[6-9]\d{9}$/;
-const PIN_RE = /^411\d{3}$/;
-
 const money = (v: number) => '₹' + v.toLocaleString('en-IN');
 
-function addressError(a: Address): string | null {
+function addressError(a: Address, pincodes: string[] | null): string | null {
   if (a.name.trim().length < 2) return 'Enter your full name.';
   if (!PHONE_RE.test(a.phone.trim())) return 'Enter a valid 10-digit mobile number.';
   if (a.street.trim().length < 8) return 'Enter your flat, building and street.';
-  if (!PIN_RE.test(a.pin.trim())) return 'We currently deliver to Pune postcodes (411xxx).';
-  return null;
+  return pinProblem(a.pin, pincodes);
+}
+
+/** Short customer-facing note about a coupon's extra conditions. */
+function couponTerms(c: Coupon): string {
+  const parts: string[] = [];
+  if (c.firstOrderOnly) parts.push('First order only');
+  else if (c.perCustomer === 1) parts.push('Once per customer');
+  else if (c.perCustomer && c.perCustomer > 1) parts.push(`Up to ${c.perCustomer} times per customer`);
+  if (c.expiresAt) parts.push('Valid till ' + new Date(c.expiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'Asia/Kolkata' }));
+  return parts.join(' · ');
 }
 
 /** crypto.randomUUID only exists on HTTPS / localhost – fall back for LAN testing on phones. */
@@ -94,11 +105,11 @@ async function readJson<T>(r: Response): Promise<T & { error?: string }> {
   }
 }
 
-async function fetchCatalog(): Promise<{ slots?: Slot[]; products?: Product[] } | null> {
+async function fetchCatalog(): Promise<CatalogResponse | null> {
   try {
     const r = await fetch('/api/catalog', { cache: 'no-store' });
     if (!r.ok) return null;
-    return await readJson<{ slots?: Slot[]; products?: Product[] }>(r);
+    return await readJson<CatalogResponse>(r);
   } catch {
     return null;
   }
@@ -391,20 +402,25 @@ const noopSubscribe = () => () => {};
  * client with the saved draft. (Fix: the old code wrote an empty cart to
  * storage before restoring it, so the draft could be lost.)
  */
-export default function Shop(props: { userName: string | null; whatsappNumber?: string; products: Product[] }) {
+export default function Shop(props: { userName: string | null; whatsappNumber?: string; products: Product[]; store: StoreInfo }) {
   const isClient = useSyncExternalStore(noopSubscribe, () => true, () => false);
-  const cat = useMemo(() => createCatalog(props.products), [props.products]);
+  const cat = useMemo(() => createCatalog(props.products, props.store.coupons), [props.products, props.store.coupons]);
   const draft = useMemo(() => (isClient ? readDraft(cat) : EMPTY_DRAFT), [isClient, cat]);
-  return <ShopApp key={isClient ? 'client' : 'server'} userName={props.userName} whatsappNumber={props.whatsappNumber} cat={cat} draft={draft} hydrated={isClient} />;
+  return <ShopApp key={isClient ? 'client' : 'server'} userName={props.userName} whatsappNumber={props.whatsappNumber} cat={cat} store={props.store} draft={draft} hydrated={isClient} />;
 }
 
 // ---------------------------------------------------------------- main component
 
-function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hydrated }: { userName: string | null; whatsappNumber?: string; cat: Catalog; draft: Draft; hydrated: boolean }) {
+function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, store, draft, hydrated }: { userName: string | null; whatsappNumber?: string; cat: Catalog; store: StoreInfo; draft: Draft; hydrated: boolean }) {
   const isMobile = useIsMobile();
-  // Live catalogue: starts with server-rendered products and refreshes from the API (prices & stock change in /admin).
+  // Live catalogue: starts with server-rendered data and refreshes from the API (prices, stock, coupons change in /admin).
   const [liveProducts, setLiveProducts] = useState<Product[] | null>(null);
-  const cat = useMemo(() => (liveProducts ? createCatalog(liveProducts) : initialCatalog), [liveProducts, initialCatalog]);
+  const [liveCoupons, setLiveCoupons] = useState<Coupon[] | null>(null);
+  const [pincodes, setPincodes] = useState<string[] | null>(store.pincodes);
+  const cat = useMemo(
+    () => (liveProducts || liveCoupons ? createCatalog(liveProducts ?? initialCatalog.products, liveCoupons ?? initialCatalog.coupons) : initialCatalog),
+    [liveProducts, liveCoupons, initialCatalog],
+  );
 
   // navigation / browsing
   // Opened from a WhatsApp tracking link (…/?track=FT-XXXXXXXX)?
@@ -422,6 +438,8 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
   // cart & checkout (persisted draft)
   const [cart, setCartState] = useState<Line[]>(draft.cart);
   const [coupon, setCoupon] = useState(draft.coupon);
+  const couponRef = useRef(coupon); // read by the catalog refresh callback
+  useEffect(() => { couponRef.current = coupon; }, [coupon]);
   const [code, setCode] = useState('');
   const [address, setAddress] = useState<Address>(draft.address);
   const [slot, setSlot] = useState(draft.slot);
@@ -429,7 +447,7 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
   const [replacement, setReplacement] = useState<'ask' | 'omit'>(draft.replacement);
   const [whatsappUpdates, setWhatsappUpdates] = useState(true);
   const [whatsappOffers, setWhatsappOffers] = useState(false);
-  const [slots, setSlots] = useState<Slot[]>(() => getSlots());
+  const [slots, setSlots] = useState<Slot[]>(store.slots);
 
   // overlays
   const [cartOpen, setCartOpen] = useState(false);
@@ -470,13 +488,24 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
   }, [cart, cat]);
   const count = cart.reduce((n, l) => n + l.qty, 0);
   const qtyOf = (id: string) => cart.find((l) => l.id === id)?.qty ?? 0;
-  const currentSlot = slots.find((s) => s.id === slot); // a stale saved slot simply counts as "not chosen"
-  const addressReady = !addressError(address);
+  // A stale saved slot, or one that has since filled up, simply counts as "not chosen".
+  const currentSlot = slots.find((s) => s.id === slot && !s.full);
+  const addressReady = !addressError(address, pincodes);
 
-  // ---- refresh live prices, stock and delivery slots from the server
-  const applyCatalog = useCallback((d: { slots?: Slot[]; products?: Product[] }) => {
-    if (d.slots?.length) setSlots(d.slots);
+  // ---- refresh live prices, stock, coupons, delivery days and area from the server
+  const applyCatalog = useCallback((d: CatalogResponse) => {
+    if (Array.isArray(d.slots)) setSlots(d.slots);
     if (Array.isArray(d.products)) setLiveProducts(d.products);
+    if (Array.isArray(d.coupons)) {
+      setLiveCoupons(d.coupons);
+      // A coupon that was switched off or expired since it was applied is removed.
+      const applied = couponRef.current;
+      if (applied && !d.coupons.some((c) => c.code === applied)) {
+        setCoupon('');
+        toast.info(`${applied} is no longer available and was removed.`);
+      }
+    }
+    if (d.pincodes !== undefined) setPincodes(d.pincodes);
   }, []);
   const refreshCatalog = useCallback(
     () => fetchCatalog().then((d) => { if (d) applyCatalog(d); }),
@@ -513,7 +542,7 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
   function setCart(next: Line[]) {
     setCartState(next);
     if (coupon && cat.priceCart(next, coupon).discount === 0) {
-      const min = coupons.find((c) => c.code === coupon)?.min ?? 0;
+      const min = cat.findCoupon(coupon)?.min ?? 0;
       setCoupon('');
       if (next.length) toast.info(`${coupon} removed — item total is now below ${money(min)}.`);
     }
@@ -570,14 +599,17 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
 
   function applyCoupon(value: string) {
     const v = value.trim().toUpperCase();
-    const c = coupons.find((x) => x.code === v);
-    if (!c) { toast.error('This coupon is not valid.'); return false; }
+    const c = cat.findCoupon(v);
+    if (!c) { toast.error('This coupon is not valid or has expired.'); return false; }
     if (totals.subtotal < c.min) { toast.error(`Add ${money(c.min - totals.subtotal)} more to use ${v}.`); return false; }
     setCoupon(v);
     setCode('');
-    toast.success(`${v} applied — you save ${money(c.amount)}`);
+    // First-order / once-per-customer limits are checked by the server when the order is placed.
+    const terms = couponTerms(c);
+    toast.success(`${v} applied — you save ${money(c.amount)}`, terms ? { description: terms } : undefined);
     return true;
   }
+
 
   // ---- baskets
   function openBasket(typeId: string, existing?: string[]) {
@@ -613,7 +645,7 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
   function saveAddress(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = { name: addressDraft.name.trim(), phone: addressDraft.phone.trim(), street: addressDraft.street.trim(), pin: addressDraft.pin.trim() };
-    const err = addressError(trimmed);
+    const err = addressError(trimmed, pincodes);
     if (err) { setAddressFormError(err); return; }
     setAddress(trimmed);
     setAddressOpen(false);
@@ -664,6 +696,7 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
           razorpayOrderId?: string;
           amount?: number;
           currency?: string;
+          expiresAt?: string;
           order?: Order;
           whatsapp?: string;
         }>(start);
@@ -680,12 +713,18 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
         if (!checkout.keyId || !checkout.razorpayOrderId || !checkout.amount || !checkout.currency) throw new Error('Payment checkout response was incomplete. Please try again.');
         await loadRazorpayCheckout();
         if (!window.Razorpay) throw new Error('Secure payment checkout is unavailable. Please try again.');
+        // Close the payment window before the server's stock hold runs out (2-minute safety margin).
+        const holdLeft = checkout.expiresAt ? Math.floor((Date.parse(checkout.expiresAt) - Date.now()) / 1000) - 120 : 1680;
+        if (!(holdLeft >= 60)) {
+          requestKey.current = '';
+          throw new Error('This payment session has expired. Please tap “Place order” again.');
+        }
         let verificationStarted = false;
         const gateway = new window.Razorpay({
           key: checkout.keyId,
           amount: checkout.amount,
           currency: checkout.currency,
-          timeout: 1800,
+          timeout: Math.min(1800, holdLeft),
           name: 'Farm’s Touch',
           description: 'Fresh grocery order',
           order_id: checkout.razorpayOrderId,
@@ -1075,14 +1114,17 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
               <p>Simple offers with clear minimums. One coupon per order.</p>
             </div>
             <div className="coupon-grid">
-              {coupons.map((o, i) => {
+              {cat.coupons.length === 0 && <p>No offers right now. Check back soon!</p>}
+              {cat.coupons.map((o, i) => {
                 const short = Math.max(0, o.min - totals.subtotal);
+                const terms = couponTerms(o);
                 return (
                   <article key={o.code} className={'coupon c' + i}>
                     <div className="coupon-left"><span>{money(o.amount)}</span><small>OFF</small></div>
                     <div className="coupon-right">
                       <h3>{o.title}</h3>
-                      <p>On item total of {money(o.min)} or more</p>
+                      <p>{o.min > 0 ? `On item total of ${money(o.min)} or more` : 'On any order'}</p>
+                      {terms && <small>{terms}</small>}
                       <div className="coupon-code">
                         <code>{o.code}</code>
                         {coupon === o.code ? (
@@ -1173,12 +1215,15 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
                     <div className="slot-chips" role="radiogroup" aria-label="Delivery slot">
                       {slots.map((s) => {
                         const [day, time] = s.label.split(' · ');
+                        const on = slot === s.id && !s.full;
                         return (
-                          <button key={s.id} role="radio" aria-checked={slot === s.id} className={slot === s.id ? 'on' : ''} onClick={() => setSlot(s.id)}>
-                            <strong>{day}</strong><small>{time}</small>
+                          <button key={s.id} role="radio" aria-checked={on} disabled={s.full} className={on ? 'on' : ''} onClick={() => setSlot(s.id)}
+                            aria-label={s.full ? `${s.label} (fully booked)` : undefined}>
+                            <strong>{day}</strong><small>{s.full ? 'Fully booked' : time}</small>
                           </button>
                         );
                       })}
+                      {slots.length === 0 && <p>No delivery days are open right now. Please check back soon or message us on WhatsApp.</p>}
                     </div>
                   </section>
 
@@ -1316,7 +1361,7 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
                 )}
                 {!coupon && (
                   <div className="coupon-suggest">
-                    {coupons.map((c) => (
+                    {cat.coupons.map((c) => (
                       <button key={c.code} onClick={() => applyCoupon(c.code)} disabled={totals.subtotal < c.min}>
                         <BadgePercent size={14} /> {c.code} · {money(c.amount)} off {totals.subtotal < c.min ? `(add ${money(c.min - totals.subtotal)})` : ''}
                       </button>
@@ -1424,7 +1469,7 @@ function ShopApp({ userName, whatsappNumber = '', cat: initialCatalog, draft, hy
           <DialogDescription>Morning delivery, 9 AM – 12 PM.</DialogDescription>
           <Select value={slot} onValueChange={(v) => { setSlot(v); setSlotOpen(false); }}>
             <SelectTrigger className="slot-select"><SelectValue placeholder="Select a day" /></SelectTrigger>
-            <SelectContent>{slots.map((s) => <SelectItem key={s.id} value={s.id}>{s.label}</SelectItem>)}</SelectContent>
+            <SelectContent>{slots.map((s) => <SelectItem key={s.id} value={s.id} disabled={s.full}>{s.label}{s.full ? ' — fully booked' : ''}</SelectItem>)}</SelectContent>
           </Select>
         </DialogContent>
       </Dialog>

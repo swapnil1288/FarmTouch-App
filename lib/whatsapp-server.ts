@@ -188,7 +188,7 @@ export async function alertStore(order: OrderRecord): Promise<void> {
     const full = [
       `🧺 New order ${order.id}`,
       ...order.items.map((it) => '• ' + describeItem(it)),
-      `Total: ₹${order.totals.total} (COD)`,
+      `Total: ₹${order.totals.total} (${order.payment === 'online' && order.paymentStatus === 'paid' ? 'paid online' : 'COD'})`,
       `Slot: ${order.slotLabel}`,
       `${order.address.name} · ${order.address.phone}`,
       `${order.address.street}, ${order.address.pin}`,
@@ -222,7 +222,7 @@ export async function listNotifications(f: { status?: string; orderId?: string; 
   const where: string[] = [];
   const args: unknown[] = [];
   if (f.orderId) { where.push('order_id = ?'); args.push(f.orderId); }
-  if (f.status === 'todo') where.push("status IN ('pending', 'failed', 'queued')");
+  if (f.status === 'todo') where.push(`status IN ${UNSENT}`);
   else if (f.status && f.status !== 'all') { where.push('status = ?'); args.push(f.status); }
   const res = await database()
     .prepare(`SELECT * FROM notifications ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ${Math.min(f.limit ?? 100, 500)}`)
@@ -231,14 +231,21 @@ export async function listNotifications(f: { status?: string; orderId?: string; 
   return res.results.map(toRow);
 }
 
+/** The order a logged message belongs to (null for offers/tests or unknown ids). */
+export async function notificationOrderId(id: number): Promise<string | null> {
+  const r = await database().prepare('SELECT order_id FROM notifications WHERE id = ?').bind(id).first<{ order_id: string | null }>();
+  return r?.order_id ?? null;
+}
+
 export async function countTodo(): Promise<number> {
-  const r = await database().prepare("SELECT COUNT(*) AS n FROM notifications WHERE status IN ('pending', 'failed')").first<{ n: number }>();
+  // Same statuses as the "To send" list, so the badge and the list always agree.
+  const r = await database().prepare(`SELECT COUNT(*) AS n FROM notifications WHERE status IN ${UNSENT}`).first<{ n: number }>();
   return r?.n ?? 0;
 }
 
 export async function markManual(id: number, by: string): Promise<boolean> {
   const r = await database()
-    .prepare("UPDATE notifications SET status = 'manual', sent_at = ?, sent_by = ?, error = NULL WHERE id = ? AND status IN ('pending', 'failed', 'queued')")
+    .prepare(`UPDATE notifications SET status = 'manual', sent_at = ?, sent_by = ?, error = NULL WHERE id = ? AND status IN ${UNSENT}`)
     .bind(new Date().toISOString(), by, id)
     .run();
   return !!r.meta.changes;
@@ -246,18 +253,30 @@ export async function markManual(id: number, by: string): Promise<boolean> {
 
 export async function dismiss(id: number, by: string): Promise<boolean> {
   const r = await database()
-    .prepare("UPDATE notifications SET status = 'skipped', error = ?, sent_by = ? WHERE id = ? AND status IN ('pending', 'failed', 'queued')")
+    .prepare(`UPDATE notifications SET status = 'skipped', error = ?, sent_by = ? WHERE id = ? AND status IN ${UNSENT}`)
     .bind('Dismissed by staff', by, id)
     .run();
   return !!r.meta.changes;
 }
 
-/** Retries one failed/pending message through the API. */
+/** Statuses that still need sending ('sending' = claimed by a request that may have died midway). */
+const UNSENT = "('pending', 'failed', 'queued', 'sending')";
+
+/** Retries one failed/pending/queued message through the API. Already-sent messages are never re-sent. */
 export async function retry(id: number): Promise<NotificationRow | null> {
   const db = database();
-  const r = await db.prepare('SELECT * FROM notifications WHERE id = ?').bind(id).first<DbRow>();
-  if (!r) return null;
-  if (!apiEnabled()) return toRow(r);
+  const existing = await db.prepare('SELECT * FROM notifications WHERE id = ?').bind(id).first<DbRow>();
+  if (!existing) return null;
+  if (!apiEnabled()) return toRow(existing);
+  // Claim the row atomically so two clicks (or two queue runs) cannot both send it.
+  const r = await db
+    .prepare(`UPDATE notifications SET status = 'sending' WHERE id = ? AND status IN ('pending', 'failed', 'queued') RETURNING *`)
+    .bind(id)
+    .first<DbRow>();
+  if (!r) {
+    const now = await db.prepare('SELECT * FROM notifications WHERE id = ?').bind(id).first<DbRow>();
+    return now ? toRow(now) : null;
+  }
   const short = r.summary || r.message.replace(/\s*\n+\s*/g, ' ').slice(0, 900);
   const res = await deliver(r.kind as NoticeKind, r.phone, r.name, r.order_id, { full: r.message, short });
   const now = new Date().toISOString();

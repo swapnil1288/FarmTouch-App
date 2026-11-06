@@ -1,9 +1,11 @@
 import { OrderValidationError, validateOrder } from '@/lib/order-validation';
 import { alertStore, notifyCustomer, upsertCustomer } from '@/lib/whatsapp-server';
-import { createOrder, findOrderByRequest, listCustomerOrders } from '@/lib/server/orders';
+import { createOrder, findOrderByRequest, listCustomerOrders, newOrderId } from '@/lib/server/orders';
 import { loadCatalog } from '@/lib/server/products';
+import { checkCouponUse, liveStore } from '@/lib/server/store';
 import { customerOwner, customerOwnerOrCreate, siteUrlFrom } from '@/lib/server/customer';
 import { HttpError, errorResponse, json, nowIso, readJsonBody } from '@/lib/server/http';
+import { rateLimit } from '@/lib/server/rate-limit';
 
 /** Orders placed from this device / account. */
 export async function GET() {
@@ -36,21 +38,25 @@ export async function POST(request: Request) {
       const saved = await findOrderByRequest(owner, key);
       if (saved) return withCookie(json({ order: saved, replay: true }), setCookie);
     }
-    const catalog = await loadCatalog();
+    // Only NEW orders count (retries of a saved order returned above are free).
+    await rateLimit(request, 'order');
+    const store = await liveStore();
+    const catalog = await loadCatalog(store.coupons);
     let validated: ReturnType<typeof validateOrder>;
     try {
-      validated = validateOrder(input, catalog);
+      validated = validateOrder(input, catalog, store);
     } catch (e) {
       if (e instanceof OrderValidationError) throw new HttpError(400, e.message);
       throw e;
     }
     const { body: b, totals, slotLabel, items, packs } = validated;
+    await checkCouponUse(b.coupon, b.address.phone);
     const createdAt = nowIso();
     const { order, created } = await createOrder(
       owner,
       b.requestKey,
       {
-        id: 'FT-' + crypto.randomUUID().slice(0, 8).toUpperCase(),
+        id: await newOrderId(),
         lines: b.lines,
         items,
         totals,

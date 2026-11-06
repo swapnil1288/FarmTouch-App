@@ -1,23 +1,24 @@
-import { applyAction, getOrder, listOrders } from '@/lib/server/orders';
+import { PACKER_STATUSES, applyAction, getOrder, listOrders, staffAccessProblem } from '@/lib/server/orders';
 import { requireStaff } from '@/lib/server/staff';
 import { HttpError, errorResponse, json, readJsonBody } from '@/lib/server/http';
-import { isOrderAction, type OrderStatus } from '@/lib/workflow';
+import { isOrderAction } from '@/lib/workflow';
 import { siteUrlFrom } from '@/lib/server/customer';
 import { listNotifications } from '@/lib/whatsapp-server';
-
-const PACKER_STATUSES: OrderStatus[] = ['placed', 'confirmed', 'packing', 'packed'];
+import { expirePaymentIntents } from '@/lib/server/razorpay';
 
 /** GET ?id=FT-… for one order with timeline, or a filtered list. */
 export async function GET(request: Request) {
   try {
     const staff = await requireStaff();
+    // The staff panel polls this list, so abandoned online checkouts return their stock even when no customer is browsing.
+    await expirePaymentIntents().catch((e: unknown) => console.error('expirePaymentIntents failed', e));
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
     if (id) {
       const order = await getOrder(id);
       if (!order) throw new HttpError(404, 'Order not found.');
-      if (staff.role === 'delivery' && order.assignee?.email !== staff.email) throw new HttpError(403, 'This order is not assigned to you.');
-      if (staff.role === 'packer' && !PACKER_STATUSES.includes(order.status)) throw new HttpError(403, 'Packers can only open orders that are waiting to be packed.');
+      const problem = staffAccessProblem(staff, order);
+      if (problem) throw new HttpError(403, problem);
       return json({ order });
     }
     const filter = {

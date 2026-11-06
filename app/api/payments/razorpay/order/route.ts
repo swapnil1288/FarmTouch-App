@@ -3,6 +3,8 @@ import { customerOwnerOrCreate } from '@/lib/server/customer';
 import { expirePaymentIntents, getPaymentIntent, razorpayKeyId, startPaymentIntent } from '@/lib/server/razorpay';
 import { HttpError, errorResponse, json, nowIso, readJsonBody } from '@/lib/server/http';
 import { loadCatalog } from '@/lib/server/products';
+import { checkCouponUse, liveStore } from '@/lib/server/store';
+import { rateLimit } from '@/lib/server/rate-limit';
 import type { NewOrder } from '@/lib/server/orders';
 import { getOrder } from '@/lib/server/orders';
 
@@ -36,15 +38,19 @@ export async function POST(request: Request) {
         expiresAt: previous.expires_at,
       }), setCookie);
     }
+    // Only new checkouts count (resuming an open one above is free).
+    await rateLimit(request, 'checkout');
     let validated: ReturnType<typeof validateOrder>;
+    const store = await liveStore();
     try {
-      validated = validateOrder(input, await loadCatalog());
+      validated = validateOrder(input, await loadCatalog(store.coupons), store);
     } catch (error) {
       if (error instanceof OrderValidationError) throw new HttpError(400, error.message);
       throw error;
     }
     const { body, totals, slotLabel, items, packs } = validated;
     if (body.payment !== 'online') throw new HttpError(400, 'Choose online payment to continue.');
+    await checkCouponUse(body.coupon, body.address.phone);
 
     const order: NewOrder = {
       id: 'FT-PENDING',

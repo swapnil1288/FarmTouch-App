@@ -1,6 +1,6 @@
 // Live catalogue stored in D1 (server only).
 import { database } from '@/lib/database';
-import { createCatalog, type Product } from '@/lib/catalog';
+import { createCatalog, type Coupon, type Product } from '@/lib/catalog';
 
 type ProductRow = {
   id: string; name: string; local: string; unit: string; price: number; mrp: number;
@@ -20,8 +20,8 @@ export async function listProducts(): Promise<Product[]> {
 }
 
 /** Catalogue for pricing/validation, including inactive products (so old lines still resolve). */
-export async function loadCatalog() {
-  return createCatalog(await listProducts());
+export async function loadCatalog(coupons: Coupon[]) {
+  return createCatalog(await listProducts(), coupons);
 }
 
 /** What a customer may see: active products only, without internal fields. */

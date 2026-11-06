@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { database } from '@/lib/database';
 import { requireStaff } from '@/lib/server/staff';
-import { STAFF_COOKIE, endAllSessions, hashPassword, passwordProblem, readCookie, verifyPassword } from '@/lib/server/auth';
+import { STAFF_COOKIE, STAFF_COOKIES, endAllSessions, hashPassword, passwordProblem, readCookie, verifyPassword } from '@/lib/server/auth';
 import { HttpError, errorResponse, json, readJsonBody } from '@/lib/server/http';
 
 const schema = z.object({ current: z.string().max(100).default(''), next: z.string() }).strict();
@@ -18,7 +18,10 @@ export async function POST(request: Request) {
     const problem = passwordProblem(parsed.data.next);
     if (problem) throw new HttpError(400, problem);
     await database().prepare('UPDATE staff SET password_hash = ?, failed_logins = 0, locked_until = NULL WHERE email = ?').bind(await hashPassword(parsed.data.next), me.email).run();
-    await endAllSessions(me.email, readCookie(request.headers.get('cookie'), STAFF_COOKIE));
+    // Keep this device signed in: sessions use a per-role cookie (older ones the legacy name).
+    const cookies = request.headers.get('cookie');
+    const current = readCookie(cookies, STAFF_COOKIES[me.role]) ?? readCookie(cookies, STAFF_COOKIE);
+    await endAllSessions(me.email, current);
     return json({ ok: true });
   } catch (e) {
     return errorResponse(e);
